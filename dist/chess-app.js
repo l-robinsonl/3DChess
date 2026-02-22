@@ -6,6 +6,15 @@
   var require_chess_app = __commonJS({
     "src/chess-app.jsx"() {
       const { useState, useEffect, useRef, useCallback } = React;
+      const PRESENCE_APP = "chess3d";
+      const PRESENCE_ROOM = "lobby";
+      const NAME_STORAGE_KEY = "chess3d_player_name";
+      function normalizePresenceStatus(status) {
+        return status === "playing" ? "playing" : "lobby";
+      }
+      function presenceLabel(status) {
+        return normalizePresenceStatus(status) === "playing" ? "playing" : "in lobby";
+      }
       function Chess3D() {
         const mountRef = useRef(null);
         const sr = useRef({
@@ -45,6 +54,8 @@
           // ── Network ──
           netClient: null,
           // P2PMeshClient instance
+          presenceClient: null,
+          // lobby presence socket
           netPeerId: null,
           // opponent's peer ID
           netRole: null
@@ -73,7 +84,16 @@
           // "" | "waiting" | "connected" | "disconnected"
           statusMsg: "",
           // human-readable connection status
-          error: ""
+          error: "",
+          nameReady: false,
+          nameInput: "",
+          playerName: "",
+          selfId: "",
+          onlinePlayers: [],
+          presenceState: "offline",
+          // offline | connecting | online
+          incomingChallenge: null,
+          outgoingChallenge: null
         });
         const refresh = useCallback(() => {
           const s = sr.current;
@@ -778,7 +798,7 @@
           };
           window.addEventListener("resize", onResize);
           return () => {
-            var _a;
+            var _a, _b;
             cancelAnimationFrame(s.animId);
             window.removeEventListener("resize", onResize);
             renderer.domElement.removeEventListener("mousedown", onDown);
@@ -791,9 +811,56 @@
               (_a = sr.current.netClient) == null ? void 0 : _a.close();
             } catch (e) {
             }
+            try {
+              (_b = sr.current.presenceClient) == null ? void 0 : _b.close();
+            } catch (e) {
+            }
           };
         }, []);
         const startGameRef = useRef(null);
+        const presenceMsgRef = useRef(null);
+        const buildOnlinePlayers = useCallback(() => {
+          var _a, _b;
+          const client = sr.current.presenceClient;
+          if (!client) return [];
+          const safeName = (v) => {
+            const t = String(v != null ? v : "").trim();
+            return t || "Player";
+          };
+          const list = [];
+          if (client.localId) {
+            list.push({
+              id: client.localId,
+              name: safeName((_a = client.meta) == null ? void 0 : _a.name),
+              status: normalizePresenceStatus((_b = client.meta) == null ? void 0 : _b.status),
+              isSelf: true
+            });
+          }
+          for (const [id, meta] of client.peerMeta.entries()) {
+            list.push({
+              id,
+              name: safeName(meta == null ? void 0 : meta.name),
+              status: normalizePresenceStatus(meta == null ? void 0 : meta.status),
+              isSelf: false
+            });
+          }
+          list.sort((a, b) => {
+            if (a.isSelf !== b.isSelf) return a.isSelf ? -1 : 1;
+            return a.name.localeCompare(b.name);
+          });
+          return list;
+        }, []);
+        const refreshOnlinePlayers = useCallback(() => {
+          const players = buildOnlinePlayers();
+          setNet((v) => {
+            var _a, _b;
+            return {
+              ...v,
+              onlinePlayers: players,
+              selfId: (_b = (_a = players.find((p) => p.isSelf)) == null ? void 0 : _a.id) != null ? _b : v.selfId
+            };
+          });
+        }, [buildOnlinePlayers]);
         const disconnectNet = useCallback(() => {
           const s = sr.current;
           if (s.netClient) {
@@ -806,10 +873,155 @@
           s.netPeerId = null;
           s.netRole = null;
         }, []);
-        const hostGame = useCallback(async (timeControlIdInput) => {
+        const disconnectPresence = useCallback(() => {
+          const s = sr.current;
+          if (s.presenceClient) {
+            try {
+              s.presenceClient.close();
+            } catch (e) {
+            }
+            s.presenceClient = null;
+          }
+          setNet((v) => ({
+            ...v,
+            presenceState: "offline",
+            onlinePlayers: [],
+            selfId: "",
+            incomingChallenge: null,
+            outgoingChallenge: null
+          }));
+        }, []);
+        const setPresenceStatus = useCallback((status) => {
+          const nextStatus = normalizePresenceStatus(status);
+          const client = sr.current.presenceClient;
+          if (client) {
+            client.updateMeta({ status: nextStatus });
+          }
+          setNet((v) => {
+            const selfId = v.selfId;
+            if (!selfId) return v;
+            return {
+              ...v,
+              onlinePlayers: v.onlinePlayers.map(
+                (p) => p.id === selfId ? { ...p, status: nextStatus } : p
+              )
+            };
+          });
+        }, []);
+        const connectPresence = useCallback(async (rawName) => {
+          const desiredName = String(rawName != null ? rawName : "").replace(/\s+/g, " ").trim().slice(0, 24);
+          if (!desiredName) {
+            setNet((v) => ({ ...v, error: "Enter your name." }));
+            return false;
+          }
+          try {
+            window.localStorage.setItem(NAME_STORAGE_KEY, desiredName);
+          } catch (e) {
+          }
+          const s = sr.current;
+          if (s.presenceClient) {
+            try {
+              s.presenceClient.close();
+            } catch (e) {
+            }
+            s.presenceClient = null;
+          }
+          setNet((v) => ({
+            ...v,
+            presenceState: "connecting",
+            statusMsg: "Connecting online lobby...",
+            error: "",
+            playerName: desiredName,
+            nameInput: desiredName
+          }));
+          const client = new P2PMeshClient({
+            app: PRESENCE_APP,
+            room: PRESENCE_ROOM,
+            signalUrl: getSignalUrl(),
+            enableRtc: false,
+            meta: { name: desiredName, status: "lobby" },
+            onStatus: (msg) => {
+              setNet((v) => ({ ...v, statusMsg: v.screen === "lobby" ? msg : v.statusMsg }));
+            },
+            onSelfMeta: (meta) => {
+              var _a;
+              const assigned = String((_a = meta == null ? void 0 : meta.name) != null ? _a : desiredName).trim() || desiredName;
+              try {
+                window.localStorage.setItem(NAME_STORAGE_KEY, assigned);
+              } catch (e) {
+              }
+              setNet((v) => ({ ...v, playerName: assigned, nameInput: assigned }));
+              refreshOnlinePlayers();
+            },
+            onPeerJoin: () => refreshOnlinePlayers(),
+            onPeerLeave: () => refreshOnlinePlayers(),
+            onPeerMeta: () => refreshOnlinePlayers(),
+            onServerMessage: (msg) => {
+              var _a;
+              return (_a = presenceMsgRef.current) == null ? void 0 : _a.call(presenceMsgRef, msg);
+            }
+          });
+          s.presenceClient = client;
+          try {
+            await client.connect();
+            setNet((v) => {
+              var _a, _b, _c, _d, _e;
+              return {
+                ...v,
+                nameReady: true,
+                playerName: String((_b = (_a = client.meta) == null ? void 0 : _a.name) != null ? _b : desiredName).trim() || desiredName,
+                nameInput: String((_d = (_c = client.meta) == null ? void 0 : _c.name) != null ? _d : desiredName).trim() || desiredName,
+                selfId: (_e = client.localId) != null ? _e : "",
+                presenceState: "online",
+                statusMsg: "Online lobby connected",
+                error: ""
+              };
+            });
+            refreshOnlinePlayers();
+            return true;
+          } catch (e) {
+            s.presenceClient = null;
+            setNet((v) => ({
+              ...v,
+              presenceState: "offline",
+              error: `Could not connect online lobby: ${e.message}`,
+              statusMsg: ""
+            }));
+            return false;
+          }
+        }, [refreshOnlinePlayers]);
+        const ensurePresenceConnected = useCallback(async () => {
+          if (sr.current.presenceClient) return true;
+          const fallbackName = (net.playerName || net.nameInput || "").trim();
+          if (!fallbackName) {
+            setNet((v) => ({ ...v, error: "Enter your name first." }));
+            return false;
+          }
+          return connectPresence(fallbackName);
+        }, [connectPresence, net.playerName, net.nameInput]);
+        const submitName = useCallback(async () => {
+          const ok = await connectPresence(net.nameInput);
+          if (!ok) return;
+          setNet((v) => ({ ...v, screen: null, error: "" }));
+        }, [connectPresence, net.nameInput]);
+        const openOnlineLobby = useCallback(async () => {
+          const ok = await ensurePresenceConnected();
+          if (!ok) return;
+          setPresenceStatus("lobby");
+          setNet((v) => ({
+            ...v,
+            screen: "lobby",
+            error: "",
+            incomingChallenge: null,
+            outgoingChallenge: null
+          }));
+          refreshOnlinePlayers();
+        }, [ensurePresenceConnected, setPresenceStatus, refreshOnlinePlayers]);
+        const hostGame = useCallback(async (timeControlIdInput, roomCodeInput = null) => {
           const signalUrl = getSignalUrl();
           const timeControl = resolveTimeControl(timeControlIdInput);
-          const code = genRoomCode();
+          const code = String(roomCodeInput || genRoomCode()).trim().toUpperCase();
+          if (!code) return false;
           setNet((v) => ({
             ...v,
             screen: "waiting",
@@ -817,7 +1029,7 @@
             timeControlId: timeControl.id,
             peerStatus: "waiting",
             error: "",
-            statusMsg: "Connecting to server\u2026"
+            statusMsg: "Connecting to game server..."
           }));
           const s = sr.current;
           disconnectNet();
@@ -828,13 +1040,13 @@
             onStatus: (msg) => setNet((v) => ({ ...v, statusMsg: msg })),
             onPeerJoin: (peerId) => {
               s.netPeerId = peerId;
-              setNet((v) => ({ ...v, peerStatus: "connecting", statusMsg: "Peer found \u2014 establishing connection\u2026" }));
+              setNet((v) => ({ ...v, peerStatus: "connecting", statusMsg: "Peer found - establishing connection..." }));
             },
             onPeerOpen: (peerId) => {
               var _a;
               s.netPeerId = peerId;
               client.sendTo(peerId, { type: "start", yourColor: B, timeControlId: timeControl.id });
-              setNet((v) => ({ ...v, screen: null, peerStatus: "connected", statusMsg: "" }));
+              setNet((v) => ({ ...v, screen: null, peerStatus: "connected", statusMsg: "", outgoingChallenge: null, incomingChallenge: null }));
               (_a = startGameRef.current) == null ? void 0 : _a.call(startGameRef, "net", W, timeControl.id);
             },
             onPeerClose: () => setNet((v) => ({ ...v, peerStatus: "disconnected", statusMsg: "Opponent disconnected" })),
@@ -847,16 +1059,18 @@
           s.netRole = "host";
           try {
             await client.connect();
+            return true;
           } catch (e) {
-            setNet((v) => ({ ...v, screen: "lobby", error: `Could not reach signaling server: `, statusMsg: "" }));
+            setNet((v) => ({ ...v, screen: "lobby", error: `Could not reach signaling server: ${e.message}`, statusMsg: "" }));
             disconnectNet();
+            return false;
           }
         }, [disconnectNet]);
         const joinGame = useCallback(async (code) => {
-          const clean = code.trim().toUpperCase();
+          const clean = String(code != null ? code : "").trim().toUpperCase();
           if (!clean) {
-            setNet((v) => ({ ...v, error: "Enter a room code" }));
-            return;
+            setNet((v) => ({ ...v, error: "Missing room code" }));
+            return false;
           }
           const signalUrl = getSignalUrl();
           setNet((v) => ({
@@ -864,7 +1078,7 @@
             screen: "joining",
             peerStatus: "waiting",
             error: "",
-            statusMsg: "Connecting to server\u2026"
+            statusMsg: "Connecting to game server..."
           }));
           const s = sr.current;
           disconnectNet();
@@ -873,10 +1087,10 @@
             room: `room-${clean}`,
             signalUrl,
             onStatus: (msg) => setNet((v) => ({ ...v, statusMsg: msg })),
-            onPeerJoin: () => setNet((v) => ({ ...v, statusMsg: "Host found \u2014 establishing connection\u2026" })),
+            onPeerJoin: () => setNet((v) => ({ ...v, statusMsg: "Host found - establishing connection..." })),
             onPeerOpen: (peerId) => {
               s.netPeerId = peerId;
-              setNet((v) => ({ ...v, peerStatus: "connected", statusMsg: "Connected! Waiting for host to start\u2026" }));
+              setNet((v) => ({ ...v, peerStatus: "connected", statusMsg: "Connected! Waiting for host to start..." }));
             },
             onPeerClose: () => setNet((v) => ({ ...v, peerStatus: "disconnected", statusMsg: "Host disconnected" })),
             onMessage: (msg) => {
@@ -888,11 +1102,76 @@
           s.netRole = "join";
           try {
             await client.connect();
+            return true;
           } catch (e) {
-            setNet((v) => ({ ...v, screen: "lobby", error: `Could not reach signaling server: `, statusMsg: "" }));
+            setNet((v) => ({ ...v, screen: "lobby", error: `Could not reach signaling server: ${e.message}`, statusMsg: "" }));
             disconnectNet();
+            return false;
           }
         }, [disconnectNet]);
+        const challengePlayer = useCallback(async (peerId) => {
+          var _a;
+          if (ui.mode === "net") {
+            setNet((v) => ({ ...v, error: "Finish the current game before challenging another player." }));
+            return;
+          }
+          const target = net.onlinePlayers.find((p) => p.id === peerId && !p.isSelf);
+          if (!target) {
+            setNet((v) => ({ ...v, error: "Selected player is no longer online." }));
+            return;
+          }
+          if (normalizePresenceStatus(target.status) === "playing") {
+            setNet((v) => ({ ...v, error: `${target.name} is already playing.` }));
+            return;
+          }
+          const presenceOk = await ensurePresenceConnected();
+          if (!presenceOk) return;
+          const roomCode = genRoomCode();
+          const timeControlId = resolveTimeControl(net.timeControlId).id;
+          const hosted = await hostGame(timeControlId, roomCode);
+          if (!hosted) return;
+          (_a = sr.current.presenceClient) == null ? void 0 : _a.sendDirect(peerId, {
+            type: "challenge",
+            roomCode,
+            timeControlId,
+            fromName: net.playerName || "Player"
+          });
+          setNet((v) => ({
+            ...v,
+            outgoingChallenge: {
+              toId: peerId,
+              toName: target.name,
+              roomCode,
+              timeControlId
+            },
+            statusMsg: `Challenge sent to ${target.name}...`,
+            error: ""
+          }));
+        }, [hostGame, ensurePresenceConnected, net.onlinePlayers, net.timeControlId, net.playerName, ui.mode]);
+        const acceptChallenge = useCallback(async () => {
+          var _a;
+          const challenge = net.incomingChallenge;
+          if (!challenge) return;
+          setNet((v) => ({ ...v, incomingChallenge: null, error: "" }));
+          (_a = sr.current.presenceClient) == null ? void 0 : _a.sendDirect(challenge.fromId, {
+            type: "challenge-accepted",
+            roomCode: challenge.roomCode,
+            timeControlId: challenge.timeControlId,
+            byName: net.playerName || "Player"
+          });
+          await joinGame(challenge.roomCode);
+        }, [joinGame, net.incomingChallenge, net.playerName]);
+        const declineChallenge = useCallback(() => {
+          var _a;
+          const challenge = net.incomingChallenge;
+          if (!challenge) return;
+          (_a = sr.current.presenceClient) == null ? void 0 : _a.sendDirect(challenge.fromId, {
+            type: "challenge-declined",
+            roomCode: challenge.roomCode,
+            byName: net.playerName || "Player"
+          });
+          setNet((v) => ({ ...v, incomingChallenge: null }));
+        }, [net.incomingChallenge, net.playerName]);
         const startGame = useCallback((mode, playerColor = W, timeControlId = "casual") => {
           const s = sr.current;
           const timeControl = resolveTimeControl(timeControlId);
@@ -919,30 +1198,84 @@
           syncHighlights();
           syncGraveyard();
           refresh();
+          setPresenceStatus(mode === "net" ? "playing" : "lobby");
           if (mode === "pvai" && playerColor === B) {
             setTimeout(() => {
               if (sr.current.turn !== sr.current.playerColor) aiMove();
             }, 600);
           }
-        }, [syncBoard, syncHighlights, syncGraveyard, refresh, aiMove, disconnectNet]);
+        }, [syncBoard, syncHighlights, syncGraveyard, refresh, aiMove, disconnectNet, setPresenceStatus]);
         startGameRef.current = startGame;
-        netMsgRef.current = ({ data }) => {
+        presenceMsgRef.current = async ({ from, payload }) => {
+          var _a, _b, _c, _d;
+          if (!payload || typeof payload !== "object") return;
+          if (payload.type === "challenge") {
+            const roomCode = String((_a = payload.roomCode) != null ? _a : "").trim().toUpperCase();
+            if (!roomCode) return;
+            const timeControlId = resolveTimeControl(payload.timeControlId).id;
+            const fromName = String((_b = payload.fromName) != null ? _b : "Player").trim() || "Player";
+            if (ui.mode === "net" || net.screen === "waiting" || net.screen === "joining") {
+              (_c = sr.current.presenceClient) == null ? void 0 : _c.sendDirect(from, {
+                type: "challenge-declined",
+                roomCode,
+                byName: net.playerName || "Player"
+              });
+              return;
+            }
+            setNet((v) => ({
+              ...v,
+              screen: "lobby",
+              incomingChallenge: {
+                fromId: from,
+                fromName,
+                roomCode,
+                timeControlId
+              },
+              error: ""
+            }));
+            return;
+          }
+          if (payload.type === "challenge-accepted") {
+            setNet((v) => ({
+              ...v,
+              outgoingChallenge: null,
+              statusMsg: "Challenge accepted. Waiting for game connection...",
+              error: ""
+            }));
+            return;
+          }
+          if (payload.type === "challenge-declined") {
+            const byName = String((_d = payload.byName) != null ? _d : "Opponent").trim() || "Opponent";
+            setNet((v) => ({
+              ...v,
+              outgoingChallenge: null,
+              screen: "lobby",
+              error: `${byName} declined your challenge.`
+            }));
+            disconnectNet();
+            setPresenceStatus("lobby");
+            return;
+          }
+        };
+        netMsgRef.current = ({ from, data }) => {
           var _a;
           const s = sr.current;
           if (!data || typeof data !== "object") return;
           if (data.type === "start") {
             const myColor = data.yourColor === B ? B : W;
             const gameClock = resolveTimeControl(data.timeControlId).id;
-            setNet((v) => ({ ...v, screen: null, peerStatus: "connected", statusMsg: "", timeControlId: gameClock }));
+            if (from) s.netPeerId = from;
+            setNet((v) => ({ ...v, screen: null, peerStatus: "connected", statusMsg: "", timeControlId: gameClock, outgoingChallenge: null, incomingChallenge: null }));
             (_a = startGameRef.current) == null ? void 0 : _a.call(startGameRef, "net", myColor, gameClock);
             return;
           }
+          if (from && s.netPeerId && from !== s.netPeerId) return;
           if (data.type === "move") {
             if (s.mode !== "net" || s.turn === s.playerColor) return;
-            const { from, to } = data;
-            if (!Array.isArray(from) || !Array.isArray(to)) return;
-            if (from.length < 2 || to.length < 2) return;
-            doMove(from, to, { relay: false });
+            const { from: mvFrom, to } = data;
+            if (!Array.isArray(mvFrom) || !Array.isArray(to)) return;
+            if (mvFrom.length < 2 || to.length < 2) return;
+            doMove(mvFrom, to, { relay: false });
             return;
           }
           if (data.type === "resign") {
@@ -958,6 +1291,21 @@
             return;
           }
         };
+        useEffect(() => {
+          let saved = "";
+          try {
+            saved = window.localStorage.getItem(NAME_STORAGE_KEY) || "";
+          } catch (e) {
+          }
+          if (saved) {
+            setNet((v) => ({ ...v, nameInput: v.nameInput || saved }));
+          }
+        }, []);
+        useEffect(() => {
+          if (ui.mode === "net" && (ui.status === "checkmate" || ui.status === "stalemate" || ui.status === "resigned" || ui.status === "timeout")) {
+            setPresenceStatus("lobby");
+          }
+        }, [ui.mode, ui.status, setPresenceStatus]);
         const turnLabel = ui.turn === W ? "White" : "Black";
         const statusMsg = () => {
           if (ui.status === "checkmate") return `\u2620 Checkmate \u2014 ${ui.turn === W ? "Black" : "White"} wins!`;
@@ -1058,6 +1406,13 @@
           appearance: "none",
           cursor: "pointer"
         };
+        const nameInputStyle = {
+          ...serverInputStyle,
+          fontFamily: "'Palatino Linotype', Palatino, serif",
+          fontWeight: "normal",
+          textTransform: "none",
+          letterSpacing: "0.01em"
+        };
         return /* @__PURE__ */ React.createElement("div", { style: {
           width: "100vw",
           height: "100vh",
@@ -1132,46 +1487,41 @@
           );
         }), /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.74em", letterSpacing: "0.03em" } }, activeTimeControl.label)), /* @__PURE__ */ React.createElement("span", { style: { color: "#4a3f2f", fontSize: "0.78em", marginLeft: "4px" } }, "Right-click drag = orbit \xA0\xB7\xA0 Scroll = zoom"), /* @__PURE__ */ React.createElement("div", { style: { marginLeft: "auto", display: "flex", gap: "10px" } }, ui.mode && !isOver && btn("\u{1F3F3} Resign", () => resignGame(), "#6a1f1f"), ui.mode && btn("\u27F5 Menu", () => {
           disconnectNet();
+          setPresenceStatus("lobby");
           const s = sr.current;
           s.mode = null;
           s.status = "idle";
-          setNet((v) => ({ ...v, screen: null, peerStatus: "" }));
+          setNet((v) => ({ ...v, screen: null, peerStatus: "", incomingChallenge: null, outgoingChallenge: null }));
           setUi((v) => ({ ...v, mode: null, status: "idle" }));
-        }, "#2a2010"), ui.mode && ui.mode !== "net" && btn("\u21BA Restart", () => startGame(ui.mode, ui.playerColor, ui.timeControlId), "#1a2a1a"))), /* @__PURE__ */ React.createElement("div", { ref: mountRef, style: { flex: 1, width: "100%", position: "relative" } }), !ui.mode && !net.screen && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: cardStyle }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: "4em", marginBottom: "4px", filter: "drop-shadow(0 0 12px #d4a84388)" } }, "\u265F"), /* @__PURE__ */ React.createElement("h1", { style: { margin: "0 0 6px", color: "#d4a843", fontSize: "2em", letterSpacing: "0.08em" } }, "3D CHESS"), /* @__PURE__ */ React.createElement("p", { style: { color: "#6a5a3a", margin: "0 0 28px", fontSize: "0.82em", letterSpacing: "0.04em" } }, "RIGHT-CLICK DRAG TO ORBIT \xA0\xB7\xA0 SCROLL TO ZOOM", /* @__PURE__ */ React.createElement("br", null), "LEFT-CLICK TO SELECT & MOVE"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: "13px" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: "6px", textAlign: "left" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" } }, "TIME CONTROL"), /* @__PURE__ */ React.createElement(
-          "select",
-          {
-            style: timeSelectStyle,
-            value: net.timeControlId,
-            onChange: (e) => setNet((v) => ({ ...v, timeControlId: e.target.value }))
-          },
-          TIME_CONTROLS.map((tc) => /* @__PURE__ */ React.createElement("option", { key: tc.id, value: tc.id }, tc.label))
-        )), btn("\u265F\u265F  Player vs Player", () => startGame("pvp", W, net.timeControlId), "#5c3d1e"), btn("\u26AA  Play as White vs AI", () => startGame("pvai", W, net.timeControlId), "#1a3a1a"), btn("\u26AB  Play as Black vs AI", () => startGame("pvai", B, net.timeControlId), "#1a1a3a"), /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid #2a1f0a", margin: "4px 0" } }), btn("\u{1F310}  Play Online", () => setNet((v) => ({ ...v, screen: "lobby", inputCode: "", error: "" })), "#1a2040")), /* @__PURE__ */ React.createElement("p", { style: { color: "#3a3020", margin: "22px 0 0", fontSize: "0.75em" } }, "AI plays random legal moves \u2014 improve it yourself!"))), net.screen === "lobby" && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: cardStyle }, /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 6px", color: "#d4a843", fontSize: "1.6em" } }, "\u{1F310} Play Online"), /* @__PURE__ */ React.createElement("p", { style: { color: "#6a5a3a", margin: "0 0 28px", fontSize: "0.82em" } }, "Create a room and share the code, or join a friend's room."), net.error && /* @__PURE__ */ React.createElement("div", { style: {
-          color: "#ff8888",
-          background: "rgba(80,0,0,0.4)",
-          border: "1px solid #aa3333",
-          borderRadius: "8px",
-          padding: "8px 14px",
-          marginBottom: "18px",
-          fontSize: "0.85em"
-        } }, net.error), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: "12px" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: "6px", textAlign: "left" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" } }, "TIME CONTROL"), /* @__PURE__ */ React.createElement(
-          "select",
-          {
-            style: timeSelectStyle,
-            value: net.timeControlId,
-            onChange: (e) => setNet((v) => ({ ...v, timeControlId: e.target.value }))
-          },
-          TIME_CONTROLS.map((tc) => /* @__PURE__ */ React.createElement("option", { key: tc.id, value: tc.id }, tc.label))
-        ), /* @__PURE__ */ React.createElement("div", { style: { color: "#6a5a3a", fontSize: "0.73em" } }, "Host selection is used for both players.")), btn("\u265F  Host a Game (play as White)", () => hostGame(net.timeControlId), "#1a3a2a"), /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid #2a1f0a", margin: "2px 0" } }), /* @__PURE__ */ React.createElement(
+        }, "#2a2010"), ui.mode && ui.mode !== "net" && btn("\u21BA Restart", () => startGame(ui.mode, ui.playerColor, ui.timeControlId), "#1a2a1a"))), /* @__PURE__ */ React.createElement("div", { ref: mountRef, style: { flex: 1, width: "100%", position: "relative" } }), !net.nameReady && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: cardStyle }, /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 10px", color: "#d4a843", fontSize: "1.7em" } }, "Choose Your Name"), /* @__PURE__ */ React.createElement("p", { style: { color: "#6a5a3a", margin: "0 0 18px", fontSize: "0.86em" } }, "This name is shown in the online lobby and challenge list."), net.error && /* @__PURE__ */ React.createElement("div", { style: { color: "#ff8888", background: "rgba(80,0,0,0.4)", border: "1px solid #aa3333", borderRadius: "8px", padding: "8px 14px", marginBottom: "14px", fontSize: "0.85em" } }, net.error), /* @__PURE__ */ React.createElement(
           "input",
           {
-            style: inputStyle,
-            placeholder: "ROOM CODE",
-            maxLength: 6,
-            value: net.inputCode,
-            onChange: (e) => setNet((v) => ({ ...v, inputCode: e.target.value.toUpperCase(), error: "" })),
-            onKeyDown: (e) => e.key === "Enter" && joinGame(net.inputCode)
+            style: nameInputStyle,
+            placeholder: "Your name",
+            maxLength: 24,
+            value: net.nameInput,
+            onChange: (e) => setNet((v) => ({ ...v, nameInput: e.target.value, error: "" })),
+            onKeyDown: (e) => e.key === "Enter" && net.presenceState !== "connecting" && submitName()
           }
-        ), btn("Join Game", () => joinGame(net.inputCode), "#1a2a3a")), /* @__PURE__ */ React.createElement("div", { style: { marginTop: "20px" } }, btn("\u2190 Back", () => setNet((v) => ({ ...v, screen: null })), "#2a2010", { fontSize: "0.85em", padding: "8px 18px" })))), net.screen === "waiting" && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: cardStyle }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: "2.5em", marginBottom: "12px" } }, "\u23F3"), /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 8px", color: "#d4a843" } }, "Waiting for Opponent"), /* @__PURE__ */ React.createElement("div", { style: { color: "#7d6e4f", fontSize: "0.72em", margin: "0 0 10px" } }, "Clock: ", resolveTimeControl(net.timeControlId).label), /* @__PURE__ */ React.createElement("p", { style: { color: "#6a5a3a", margin: "0 0 22px", fontSize: "0.84em" } }, "Share this code with your opponent:"), /* @__PURE__ */ React.createElement("div", { style: {
+        ), /* @__PURE__ */ React.createElement("div", { style: { marginTop: "16px" } }, btn(net.presenceState === "connecting" ? "Connecting..." : "Continue", () => {
+          if (net.presenceState !== "connecting") submitName();
+        }, "#1a3a2a", { minWidth: "170px" })))), net.nameReady && !ui.mode && !net.screen && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: cardStyle }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: "4em", marginBottom: "4px", filter: "drop-shadow(0 0 12px #d4a84388)" } }, "\u265F"), /* @__PURE__ */ React.createElement("h1", { style: { margin: "0 0 6px", color: "#d4a843", fontSize: "2em", letterSpacing: "0.08em" } }, "3D CHESS"), /* @__PURE__ */ React.createElement("p", { style: { color: "#6a5a3a", margin: "0 0 28px", fontSize: "0.82em", letterSpacing: "0.04em" } }, "RIGHT-CLICK DRAG TO ORBIT \xA0\xB7\xA0 SCROLL TO ZOOM", /* @__PURE__ */ React.createElement("br", null), "LEFT-CLICK TO SELECT & MOVE"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: "13px" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: "6px", textAlign: "left" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" } }, "TIME CONTROL"), /* @__PURE__ */ React.createElement(
+          "select",
+          {
+            style: timeSelectStyle,
+            value: net.timeControlId,
+            onChange: (e) => setNet((v) => ({ ...v, timeControlId: e.target.value }))
+          },
+          TIME_CONTROLS.map((tc) => /* @__PURE__ */ React.createElement("option", { key: tc.id, value: tc.id }, tc.label))
+        )), btn("\u265F\u265F  Player vs Player", () => startGame("pvp", W, net.timeControlId), "#5c3d1e"), btn("\u26AA  Play as White vs AI", () => startGame("pvai", W, net.timeControlId), "#1a3a1a"), btn("\u26AB  Play as Black vs AI", () => startGame("pvai", B, net.timeControlId), "#1a1a3a"), /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid #2a1f0a", margin: "4px 0" } }), btn("\u{1F310}  Play Online", () => openOnlineLobby(), "#1a2040")), /* @__PURE__ */ React.createElement("p", { style: { color: "#3a3020", margin: "22px 0 0", fontSize: "0.75em" } }, "AI plays random legal moves \u2014 improve it yourself!"))), net.screen === "lobby" && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: { ...cardStyle, minWidth: "560px", maxWidth: "760px", width: "92vw" } }, /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 6px", color: "#d4a843", fontSize: "1.6em" } }, "\u{1F310} Online Lobby"), /* @__PURE__ */ React.createElement("p", { style: { color: "#6a5a3a", margin: "0 0 18px", fontSize: "0.82em" } }, "Signed in as ", /* @__PURE__ */ React.createElement("strong", null, net.playerName || "Player"), " \xB7 ", net.presenceState === "online" ? "connected" : net.presenceState), net.error && /* @__PURE__ */ React.createElement("div", { style: { color: "#ff8888", background: "rgba(80,0,0,0.4)", border: "1px solid #aa3333", borderRadius: "8px", padding: "8px 14px", marginBottom: "14px", fontSize: "0.85em" } }, net.error), net.incomingChallenge && /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid #6b4f10", borderRadius: "10px", padding: "12px", marginBottom: "14px", background: "rgba(60,40,10,0.35)" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#f0d9b5", marginBottom: "8px", fontSize: "0.94em" } }, "Challenge from ", /* @__PURE__ */ React.createElement("strong", null, net.incomingChallenge.fromName), " (", resolveTimeControl(net.incomingChallenge.timeControlId).label, ")"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: "10px", justifyContent: "center" } }, btn("Accept", () => acceptChallenge(), "#1a3a2a", { fontSize: "0.84em", padding: "8px 14px" }), btn("Decline", () => declineChallenge(), "#5a1f1f", { fontSize: "0.84em", padding: "8px 14px" }))), net.outgoingChallenge && /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid #2a5f9f", borderRadius: "10px", padding: "10px", marginBottom: "14px", background: "rgba(25,45,75,0.35)", color: "#9bc2ff", fontSize: "0.84em" } }, "Waiting for ", /* @__PURE__ */ React.createElement("strong", null, net.outgoingChallenge.toName), " to accept your challenge..."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: "6px", textAlign: "left", marginBottom: "10px" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" } }, "TIME CONTROL (for your outgoing challenge)"), /* @__PURE__ */ React.createElement(
+          "select",
+          {
+            style: timeSelectStyle,
+            value: net.timeControlId,
+            onChange: (e) => setNet((v) => ({ ...v, timeControlId: e.target.value, error: "" }))
+          },
+          TIME_CONTROLS.map((tc) => /* @__PURE__ */ React.createElement("option", { key: tc.id, value: tc.id }, tc.label))
+        )), /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid #2a1f0a", borderRadius: "10px", overflow: "hidden", background: "rgba(0,0,0,0.22)" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr auto", padding: "9px 12px", borderBottom: "1px solid #2a1f0a", color: "#8a7a58", fontSize: "0.76em", letterSpacing: "0.04em" } }, /* @__PURE__ */ React.createElement("div", null, "PLAYER"), /* @__PURE__ */ React.createElement("div", null, "STATUS / ACTION")), /* @__PURE__ */ React.createElement("div", { style: { maxHeight: "280px", overflowY: "auto" } }, net.onlinePlayers.length <= 1 ? /* @__PURE__ */ React.createElement("div", { style: { padding: "14px 12px", color: "#7d6e4f", fontSize: "0.84em" } }, "No other players online yet.") : net.onlinePlayers.map((player) => /* @__PURE__ */ React.createElement("div", { key: player.id, style: { display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", gap: "10px", padding: "10px 12px", borderTop: "1px solid rgba(255,255,255,0.04)" } }, /* @__PURE__ */ React.createElement("div", { style: { textAlign: "left" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#f0d9b5", fontSize: "0.93em" } }, player.name, player.isSelf ? " (You)" : ""), /* @__PURE__ */ React.createElement("div", { style: { color: "#7d6e4f", fontSize: "0.75em" } }, player.id.slice(0, 8))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: "10px" } }, /* @__PURE__ */ React.createElement("span", { style: { color: normalizePresenceStatus(player.status) === "playing" ? "#f39a9a" : "#8fd39a", fontSize: "0.8em", minWidth: "72px", textAlign: "right" } }, presenceLabel(player.status)), !player.isSelf && btn("Challenge", () => challengePlayer(player.id), "#1a3a2a", { fontSize: "0.8em", padding: "7px 12px" })))))), /* @__PURE__ */ React.createElement("div", { style: { marginTop: "16px" } }, btn("\u2190 Back", () => setNet((v) => ({ ...v, screen: null, error: "" })), "#2a2010", { fontSize: "0.85em", padding: "8px 18px" })))), net.screen === "waiting" && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: cardStyle }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: "2.5em", marginBottom: "12px" } }, "\u23F3"), /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 8px", color: "#d4a843" } }, "Waiting for Opponent"), /* @__PURE__ */ React.createElement("div", { style: { color: "#7d6e4f", fontSize: "0.72em", margin: "0 0 10px" } }, "Clock: ", resolveTimeControl(net.timeControlId).label), /* @__PURE__ */ React.createElement("p", { style: { color: "#6a5a3a", margin: "0 0 22px", fontSize: "0.84em" } }, "Waiting for opponent to join this game:"), /* @__PURE__ */ React.createElement("div", { style: {
           fontSize: "2.8em",
           fontFamily: "monospace",
           fontWeight: "bold",
@@ -1186,7 +1536,8 @@
           cursor: "text"
         } }, net.code), /* @__PURE__ */ React.createElement("div", { style: { color: "#888", fontSize: "0.8em", marginBottom: "22px", animation: "pulse 2s ease-in-out infinite" } }, net.statusMsg || "Waiting for someone to join\u2026"), btn("Cancel", () => {
           disconnectNet();
-          setNet((v) => ({ ...v, screen: "lobby" }));
+          setPresenceStatus("lobby");
+          setNet((v) => ({ ...v, screen: "lobby", outgoingChallenge: null }));
         }, "#3a1010", { fontSize: "0.85em", padding: "8px 18px" }))), net.screen === "joining" && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: cardStyle }, /* @__PURE__ */ React.createElement("div", { style: {
           fontSize: "2em",
           marginBottom: "12px",
@@ -1194,7 +1545,8 @@
           animation: "spin 1.2s linear infinite"
         } }, "\u2699"), /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 16px", color: "#d4a843" } }, "Joining Game\u2026"), /* @__PURE__ */ React.createElement("div", { style: { color: "#7d6e4f", fontSize: "0.72em", margin: "0 0 10px" } }, "Clock: ", resolveTimeControl(net.timeControlId).label), /* @__PURE__ */ React.createElement("div", { style: { color: "#a09070", fontSize: "0.88em", marginBottom: "22px" } }, net.statusMsg || "Connecting\u2026"), btn("Cancel", () => {
           disconnectNet();
-          setNet((v) => ({ ...v, screen: "lobby" }));
+          setPresenceStatus("lobby");
+          setNet((v) => ({ ...v, screen: "lobby", outgoingChallenge: null }));
         }, "#3a1010", { fontSize: "0.85em", padding: "8px 18px" }))), ui.mode === "net" && net.peerStatus === "disconnected" && /* @__PURE__ */ React.createElement("div", { style: {
           position: "absolute",
           inset: 0,
@@ -1204,12 +1556,16 @@
           background: "rgba(0,0,0,0.72)",
           backdropFilter: "blur(3px)",
           zIndex: 20
-        } }, /* @__PURE__ */ React.createElement("div", { style: { ...cardStyle, border: "2px solid #8b2020" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: "3em", marginBottom: "8px" } }, "\u{1F50C}"), /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 10px", color: "#d4a843" } }, "Opponent Disconnected"), /* @__PURE__ */ React.createElement("p", { style: { color: "#a09070", margin: "0 0 24px", fontSize: "0.88em" } }, "The connection to your opponent was lost."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: "12px", justifyContent: "center" } }, btn("\u{1F310} Play Again Online", () => setNet((v) => ({ ...v, screen: "lobby", peerStatus: "", error: "" })), "#1a2040"), btn("\u27F5 Main Menu", () => {
+        } }, /* @__PURE__ */ React.createElement("div", { style: { ...cardStyle, border: "2px solid #8b2020" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: "3em", marginBottom: "8px" } }, "\u{1F50C}"), /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 10px", color: "#d4a843" } }, "Opponent Disconnected"), /* @__PURE__ */ React.createElement("p", { style: { color: "#a09070", margin: "0 0 24px", fontSize: "0.88em" } }, "The connection to your opponent was lost."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: "12px", justifyContent: "center" } }, btn("\u{1F310} Play Again Online", () => {
+          setPresenceStatus("lobby");
+          setNet((v) => ({ ...v, screen: "lobby", peerStatus: "", error: "", outgoingChallenge: null, incomingChallenge: null }));
+        }, "#1a2040"), btn("\u27F5 Main Menu", () => {
           disconnectNet();
+          setPresenceStatus("lobby");
           const s = sr.current;
           s.mode = null;
           s.status = "idle";
-          setNet((v) => ({ ...v, screen: null, peerStatus: "" }));
+          setNet((v) => ({ ...v, screen: null, peerStatus: "", incomingChallenge: null, outgoingChallenge: null }));
           setUi((v) => ({ ...v, mode: null, status: "idle" }));
         }, "#2a2010")))), ui.mode && isOver && net.peerStatus !== "disconnected" && /* @__PURE__ */ React.createElement("div", { style: {
           position: "absolute",
@@ -1232,10 +1588,11 @@
           pointerEvents: "all"
         } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: "3.5em", marginBottom: "8px" } }, ui.status === "checkmate" ? "\u265A" : ui.status === "resigned" ? "\u{1F3F3}" : ui.status === "timeout" ? "\u23F0" : "\u{1F91D}"), /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 22px", color: "#d4a843", fontSize: "1.5em" } }, statusMsg()), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: "14px", justifyContent: "center" } }, ui.mode !== "net" && btn("\u21BA Play Again", () => startGame(ui.mode, ui.playerColor, ui.timeControlId), "#1a3a1a"), btn("\u27F5 Menu", () => {
           disconnectNet();
+          setPresenceStatus("lobby");
           const s = sr.current;
           s.mode = null;
           s.status = "idle";
-          setNet((v) => ({ ...v, screen: null, peerStatus: "" }));
+          setNet((v) => ({ ...v, screen: null, peerStatus: "", incomingChallenge: null, outgoingChallenge: null }));
           setUi((v) => ({ ...v, mode: null, status: "idle" }));
         }, "#3a1a1a")))));
       }

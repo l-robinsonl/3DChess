@@ -1,4 +1,16 @@
 const { useState, useEffect, useRef, useCallback } = React;
+
+const PRESENCE_APP = "chess3d";
+const PRESENCE_ROOM = "lobby";
+const NAME_STORAGE_KEY = "chess3d_player_name";
+
+function normalizePresenceStatus(status) {
+  return status === "playing" ? "playing" : "lobby";
+}
+
+function presenceLabel(status) {
+  return normalizePresenceStatus(status) === "playing" ? "playing" : "in lobby";
+}
 // ─── Main Component ───────────────────────────────────────────────────────────
 
 function Chess3D() {
@@ -35,6 +47,7 @@ function Chess3D() {
     wasDrag: false,
     // ── Network ──
     netClient:  null,   // P2PMeshClient instance
+    presenceClient: null, // lobby presence socket
     netPeerId:  null,   // opponent's peer ID
     netRole:    null,   // "host" | "join"
   });
@@ -57,6 +70,14 @@ function Chess3D() {
     peerStatus: "",    // "" | "waiting" | "connected" | "disconnected"
     statusMsg: "",     // human-readable connection status
     error: "",
+    nameReady: false,
+    nameInput: "",
+    playerName: "",
+    selfId: "",
+    onlinePlayers: [],
+    presenceState: "offline", // offline | connecting | online
+    incomingChallenge: null,
+    outgoingChallenge: null,
   });
 
   const refresh = useCallback(() => {
@@ -925,89 +946,393 @@ function Chess3D() {
       renderer.domElement.removeEventListener("wheel", onWheel);
       if (el.contains(renderer.domElement)) el.removeChild(renderer.domElement);
       renderer.dispose();
-      // Close any open net connection
+      // Close any open network connections
       try { sr.current.netClient?.close(); } catch {}
+      try { sr.current.presenceClient?.close(); } catch {}
     };
   }, []);
 
   // startGameRef avoids circular dependency: hostGame is defined before startGame
   const startGameRef = useRef(null);
+  const presenceMsgRef = useRef(null);
 
   // ── Network helpers ──────────────────────────────────────────────────────────
 
-  const disconnectNet = useCallback(() => {
-    const s = sr.current;
-    if (s.netClient) { try { s.netClient.close(); } catch {} s.netClient = null; }
-    s.netPeerId = null; s.netRole = null;
+  const buildOnlinePlayers = useCallback(() => {
+    const client = sr.current.presenceClient;
+    if (!client) return [];
+
+    const safeName = (v) => {
+      const t = String(v ?? "").trim();
+      return t || "Player";
+    };
+
+    const list = [];
+    if (client.localId) {
+      list.push({
+        id: client.localId,
+        name: safeName(client.meta?.name),
+        status: normalizePresenceStatus(client.meta?.status),
+        isSelf: true,
+      });
+    }
+
+    for (const [id, meta] of client.peerMeta.entries()) {
+      list.push({
+        id,
+        name: safeName(meta?.name),
+        status: normalizePresenceStatus(meta?.status),
+        isSelf: false,
+      });
+    }
+
+    list.sort((a, b) => {
+      if (a.isSelf !== b.isSelf) return a.isSelf ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+
+    return list;
   }, []);
 
+  const refreshOnlinePlayers = useCallback(() => {
+    const players = buildOnlinePlayers();
+    setNet((v) => ({
+      ...v,
+      onlinePlayers: players,
+      selfId: players.find((p) => p.isSelf)?.id ?? v.selfId,
+    }));
+  }, [buildOnlinePlayers]);
+
+  const disconnectNet = useCallback(() => {
+    const s = sr.current;
+    if (s.netClient) {
+      try { s.netClient.close(); } catch {}
+      s.netClient = null;
+    }
+    s.netPeerId = null;
+    s.netRole = null;
+  }, []);
+
+  const disconnectPresence = useCallback(() => {
+    const s = sr.current;
+    if (s.presenceClient) {
+      try { s.presenceClient.close(); } catch {}
+      s.presenceClient = null;
+    }
+    setNet((v) => ({
+      ...v,
+      presenceState: "offline",
+      onlinePlayers: [],
+      selfId: "",
+      incomingChallenge: null,
+      outgoingChallenge: null,
+    }));
+  }, []);
+
+  const setPresenceStatus = useCallback((status) => {
+    const nextStatus = normalizePresenceStatus(status);
+    const client = sr.current.presenceClient;
+    if (client) {
+      client.updateMeta({ status: nextStatus });
+    }
+    setNet((v) => {
+      const selfId = v.selfId;
+      if (!selfId) return v;
+      return {
+        ...v,
+        onlinePlayers: v.onlinePlayers.map((p) =>
+          p.id === selfId ? { ...p, status: nextStatus } : p
+        ),
+      };
+    });
+  }, []);
+
+  const connectPresence = useCallback(async (rawName) => {
+    const desiredName = String(rawName ?? "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 24);
+
+    if (!desiredName) {
+      setNet((v) => ({ ...v, error: "Enter your name." }));
+      return false;
+    }
+
+    try { window.localStorage.setItem(NAME_STORAGE_KEY, desiredName); } catch {}
+
+    const s = sr.current;
+    if (s.presenceClient) {
+      try { s.presenceClient.close(); } catch {}
+      s.presenceClient = null;
+    }
+
+    setNet((v) => ({
+      ...v,
+      presenceState: "connecting",
+      statusMsg: "Connecting online lobby...",
+      error: "",
+      playerName: desiredName,
+      nameInput: desiredName,
+    }));
+
+    const client = new P2PMeshClient({
+      app: PRESENCE_APP,
+      room: PRESENCE_ROOM,
+      signalUrl: getSignalUrl(),
+      enableRtc: false,
+      meta: { name: desiredName, status: "lobby" },
+      onStatus: (msg) => {
+        setNet((v) => ({ ...v, statusMsg: v.screen === "lobby" ? msg : v.statusMsg }));
+      },
+      onSelfMeta: (meta) => {
+        const assigned = String(meta?.name ?? desiredName).trim() || desiredName;
+        try { window.localStorage.setItem(NAME_STORAGE_KEY, assigned); } catch {}
+        setNet((v) => ({ ...v, playerName: assigned, nameInput: assigned }));
+        refreshOnlinePlayers();
+      },
+      onPeerJoin: () => refreshOnlinePlayers(),
+      onPeerLeave: () => refreshOnlinePlayers(),
+      onPeerMeta: () => refreshOnlinePlayers(),
+      onServerMessage: (msg) => presenceMsgRef.current?.(msg),
+    });
+
+    s.presenceClient = client;
+
+    try {
+      await client.connect();
+      setNet((v) => ({
+        ...v,
+        nameReady: true,
+        playerName: String(client.meta?.name ?? desiredName).trim() || desiredName,
+        nameInput: String(client.meta?.name ?? desiredName).trim() || desiredName,
+        selfId: client.localId ?? "",
+        presenceState: "online",
+        statusMsg: "Online lobby connected",
+        error: "",
+      }));
+      refreshOnlinePlayers();
+      return true;
+    } catch (e) {
+      s.presenceClient = null;
+      setNet((v) => ({
+        ...v,
+        presenceState: "offline",
+        error: `Could not connect online lobby: ${e.message}`,
+        statusMsg: "",
+      }));
+      return false;
+    }
+  }, [refreshOnlinePlayers]);
+
+  const ensurePresenceConnected = useCallback(async () => {
+    if (sr.current.presenceClient) return true;
+    const fallbackName = (net.playerName || net.nameInput || "").trim();
+    if (!fallbackName) {
+      setNet((v) => ({ ...v, error: "Enter your name first." }));
+      return false;
+    }
+    return connectPresence(fallbackName);
+  }, [connectPresence, net.playerName, net.nameInput]);
+
+  const submitName = useCallback(async () => {
+    const ok = await connectPresence(net.nameInput);
+    if (!ok) return;
+    setNet((v) => ({ ...v, screen: null, error: "" }));
+  }, [connectPresence, net.nameInput]);
+
+  const openOnlineLobby = useCallback(async () => {
+    const ok = await ensurePresenceConnected();
+    if (!ok) return;
+    setPresenceStatus("lobby");
+    setNet((v) => ({
+      ...v,
+      screen: "lobby",
+      error: "",
+      incomingChallenge: null,
+      outgoingChallenge: null,
+    }));
+    refreshOnlinePlayers();
+  }, [ensurePresenceConnected, setPresenceStatus, refreshOnlinePlayers]);
+
   // Host: generate code, connect, wait for peer's data channel to open, then begin
-  const hostGame = useCallback(async (timeControlIdInput) => {
+  const hostGame = useCallback(async (timeControlIdInput, roomCodeInput = null) => {
     const signalUrl = getSignalUrl();
     const timeControl = resolveTimeControl(timeControlIdInput);
-    const code = genRoomCode();
-    setNet(v => ({
+    const code = String(roomCodeInput || genRoomCode()).trim().toUpperCase();
+    if (!code) return false;
+
+    setNet((v) => ({
       ...v,
       screen: "waiting",
       code,
       timeControlId: timeControl.id,
       peerStatus: "waiting",
       error: "",
-      statusMsg: "Connecting to server…",
+      statusMsg: "Connecting to game server...",
     }));
+
     const s = sr.current;
     disconnectNet();
+
     const client = new P2PMeshClient({
-      app: "chess3d", room: `room-${code}`, signalUrl,
-      onStatus: msg => setNet(v => ({ ...v, statusMsg: msg })),
-      onPeerJoin: peerId => { s.netPeerId = peerId; setNet(v => ({ ...v, peerStatus: "connecting", statusMsg: "Peer found — establishing connection…" })); },
-      onPeerOpen: peerId => {
+      app: "chess3d",
+      room: `room-${code}`,
+      signalUrl,
+      onStatus: (msg) => setNet((v) => ({ ...v, statusMsg: msg })),
+      onPeerJoin: (peerId) => {
         s.netPeerId = peerId;
-        // Tell joiner they are black
+        setNet((v) => ({ ...v, peerStatus: "connecting", statusMsg: "Peer found - establishing connection..." }));
+      },
+      onPeerOpen: (peerId) => {
+        s.netPeerId = peerId;
         client.sendTo(peerId, { type: "start", yourColor: B, timeControlId: timeControl.id });
-        setNet(v => ({ ...v, screen: null, peerStatus: "connected", statusMsg: "" }));
+        setNet((v) => ({ ...v, screen: null, peerStatus: "connected", statusMsg: "", outgoingChallenge: null, incomingChallenge: null }));
         startGameRef.current?.("net", W, timeControl.id);
       },
-      onPeerClose: () => setNet(v => ({ ...v, peerStatus: "disconnected", statusMsg: "Opponent disconnected" })),
-      onMessage: msg => netMsgRef.current?.(msg),
+      onPeerClose: () => setNet((v) => ({ ...v, peerStatus: "disconnected", statusMsg: "Opponent disconnected" })),
+      onMessage: (msg) => netMsgRef.current?.(msg),
     });
-    s.netClient = client; s.netRole = "host";
-    try { await client.connect(); }
-    catch (e) { setNet(v => ({ ...v, screen: "lobby", error: `Could not reach signaling server: `, statusMsg: "" })); disconnectNet(); }
+
+    s.netClient = client;
+    s.netRole = "host";
+
+    try {
+      await client.connect();
+      return true;
+    } catch (e) {
+      setNet((v) => ({ ...v, screen: "lobby", error: `Could not reach signaling server: ${e.message}`, statusMsg: "" }));
+      disconnectNet();
+      return false;
+    }
   }, [disconnectNet]);
 
   // Join: connect with given code, wait for host's "start" message
   const joinGame = useCallback(async (code) => {
-    const clean = code.trim().toUpperCase();
-    if (!clean) { setNet(v => ({ ...v, error: "Enter a room code" })); return; }
+    const clean = String(code ?? "").trim().toUpperCase();
+    if (!clean) {
+      setNet((v) => ({ ...v, error: "Missing room code" }));
+      return false;
+    }
+
     const signalUrl = getSignalUrl();
-    setNet(v => ({
+    setNet((v) => ({
       ...v,
       screen: "joining",
       peerStatus: "waiting",
       error: "",
-      statusMsg: "Connecting to server…",
+      statusMsg: "Connecting to game server...",
     }));
+
     const s = sr.current;
     disconnectNet();
+
     const client = new P2PMeshClient({
-      app: "chess3d", room: `room-${clean}`, signalUrl,
-      onStatus: msg => setNet(v => ({ ...v, statusMsg: msg })),
-      onPeerJoin: () => setNet(v => ({ ...v, statusMsg: "Host found — establishing connection…" })),
-      onPeerOpen: peerId => { s.netPeerId = peerId; setNet(v => ({ ...v, peerStatus: "connected", statusMsg: "Connected! Waiting for host to start…" })); },
-      onPeerClose: () => setNet(v => ({ ...v, peerStatus: "disconnected", statusMsg: "Host disconnected" })),
-      onMessage: msg => netMsgRef.current?.(msg),
+      app: "chess3d",
+      room: `room-${clean}`,
+      signalUrl,
+      onStatus: (msg) => setNet((v) => ({ ...v, statusMsg: msg })),
+      onPeerJoin: () => setNet((v) => ({ ...v, statusMsg: "Host found - establishing connection..." })),
+      onPeerOpen: (peerId) => {
+        s.netPeerId = peerId;
+        setNet((v) => ({ ...v, peerStatus: "connected", statusMsg: "Connected! Waiting for host to start..." }));
+      },
+      onPeerClose: () => setNet((v) => ({ ...v, peerStatus: "disconnected", statusMsg: "Host disconnected" })),
+      onMessage: (msg) => netMsgRef.current?.(msg),
     });
-    s.netClient = client; s.netRole = "join";
-    try { await client.connect(); }
-    catch (e) { setNet(v => ({ ...v, screen: "lobby", error: `Could not reach signaling server: `, statusMsg: "" })); disconnectNet(); }
+
+    s.netClient = client;
+    s.netRole = "join";
+
+    try {
+      await client.connect();
+      return true;
+    } catch (e) {
+      setNet((v) => ({ ...v, screen: "lobby", error: `Could not reach signaling server: ${e.message}`, statusMsg: "" }));
+      disconnectNet();
+      return false;
+    }
   }, [disconnectNet]);
+
+  const challengePlayer = useCallback(async (peerId) => {
+    if (ui.mode === "net") {
+      setNet((v) => ({ ...v, error: "Finish the current game before challenging another player." }));
+      return;
+    }
+
+    const target = net.onlinePlayers.find((p) => p.id === peerId && !p.isSelf);
+    if (!target) {
+      setNet((v) => ({ ...v, error: "Selected player is no longer online." }));
+      return;
+    }
+
+    if (normalizePresenceStatus(target.status) === "playing") {
+      setNet((v) => ({ ...v, error: `${target.name} is already playing.` }));
+      return;
+    }
+
+    const presenceOk = await ensurePresenceConnected();
+    if (!presenceOk) return;
+
+    const roomCode = genRoomCode();
+    const timeControlId = resolveTimeControl(net.timeControlId).id;
+    const hosted = await hostGame(timeControlId, roomCode);
+    if (!hosted) return;
+
+    sr.current.presenceClient?.sendDirect(peerId, {
+      type: "challenge",
+      roomCode,
+      timeControlId,
+      fromName: net.playerName || "Player",
+    });
+
+    setNet((v) => ({
+      ...v,
+      outgoingChallenge: {
+        toId: peerId,
+        toName: target.name,
+        roomCode,
+        timeControlId,
+      },
+      statusMsg: `Challenge sent to ${target.name}...`,
+      error: "",
+    }));
+  }, [hostGame, ensurePresenceConnected, net.onlinePlayers, net.timeControlId, net.playerName, ui.mode]);
+
+  const acceptChallenge = useCallback(async () => {
+    const challenge = net.incomingChallenge;
+    if (!challenge) return;
+
+    setNet((v) => ({ ...v, incomingChallenge: null, error: "" }));
+    sr.current.presenceClient?.sendDirect(challenge.fromId, {
+      type: "challenge-accepted",
+      roomCode: challenge.roomCode,
+      timeControlId: challenge.timeControlId,
+      byName: net.playerName || "Player",
+    });
+
+    await joinGame(challenge.roomCode);
+  }, [joinGame, net.incomingChallenge, net.playerName]);
+
+  const declineChallenge = useCallback(() => {
+    const challenge = net.incomingChallenge;
+    if (!challenge) return;
+
+    sr.current.presenceClient?.sendDirect(challenge.fromId, {
+      type: "challenge-declined",
+      roomCode: challenge.roomCode,
+      byName: net.playerName || "Player",
+    });
+
+    setNet((v) => ({ ...v, incomingChallenge: null }));
+  }, [net.incomingChallenge, net.playerName]);
 
   // Start / restart game
   const startGame = useCallback((mode, playerColor = W, timeControlId = "casual") => {
     const s = sr.current;
     const timeControl = resolveTimeControl(timeControlId);
+
     if (mode !== "net") disconnectNet();
+
     s.board = mkBoard();
     s.turn = W;
     s.selected = null;
@@ -1026,8 +1351,8 @@ function Chess3D() {
     s.aiThinking = false;
     s.captured = { [W]: [], [B]: [] };
 
-    s.spherical.theta  = playerColor === W ? 0 : Math.PI;
-    s.spherical.phi    = 0.85;
+    s.spherical.theta = playerColor === W ? 0 : Math.PI;
+    s.spherical.phi = 0.85;
     s.spherical.radius = 14;
     if (s.updateCam) s.updateCam();
 
@@ -1036,36 +1361,96 @@ function Chess3D() {
     syncGraveyard();
     refresh();
 
+    setPresenceStatus(mode === "net" ? "playing" : "lobby");
+
     if (mode === "pvai" && playerColor === B) {
-      setTimeout(() => { if (sr.current.turn !== sr.current.playerColor) aiMove(); }, 600);
+      setTimeout(() => {
+        if (sr.current.turn !== sr.current.playerColor) aiMove();
+      }, 600);
     }
-  }, [syncBoard, syncHighlights, syncGraveyard, refresh, aiMove, disconnectNet]);
+  }, [syncBoard, syncHighlights, syncGraveyard, refresh, aiMove, disconnectNet, setPresenceStatus]);
 
   // Keep ref in sync so hostGame/joinGame can call startGame without circular dep
   startGameRef.current = startGame;
 
+  presenceMsgRef.current = async ({ from, payload }) => {
+    if (!payload || typeof payload !== "object") return;
+
+    if (payload.type === "challenge") {
+      const roomCode = String(payload.roomCode ?? "").trim().toUpperCase();
+      if (!roomCode) return;
+      const timeControlId = resolveTimeControl(payload.timeControlId).id;
+      const fromName = String(payload.fromName ?? "Player").trim() || "Player";
+
+      if (ui.mode === "net" || net.screen === "waiting" || net.screen === "joining") {
+        sr.current.presenceClient?.sendDirect(from, {
+          type: "challenge-declined",
+          roomCode,
+          byName: net.playerName || "Player",
+        });
+        return;
+      }
+
+      setNet((v) => ({
+        ...v,
+        screen: "lobby",
+        incomingChallenge: {
+          fromId: from,
+          fromName,
+          roomCode,
+          timeControlId,
+        },
+        error: "",
+      }));
+      return;
+    }
+
+    if (payload.type === "challenge-accepted") {
+      setNet((v) => ({
+        ...v,
+        outgoingChallenge: null,
+        statusMsg: "Challenge accepted. Waiting for game connection...",
+        error: "",
+      }));
+      return;
+    }
+
+    if (payload.type === "challenge-declined") {
+      const byName = String(payload.byName ?? "Opponent").trim() || "Opponent";
+      setNet((v) => ({
+        ...v,
+        outgoingChallenge: null,
+        screen: "lobby",
+        error: `${byName} declined your challenge.`,
+      }));
+      disconnectNet();
+      setPresenceStatus("lobby");
+      return;
+    }
+  };
+
   // ── Net message handler — written to ref every render so it's always current ─
-  netMsgRef.current = ({ data }) => {
+  netMsgRef.current = ({ from, data }) => {
     const s = sr.current;
     if (!data || typeof data !== "object") return;
 
     if (data.type === "start") {
-      // Joiner receives their colour from the host
       const myColor = data.yourColor === B ? B : W;
       const gameClock = resolveTimeControl(data.timeControlId).id;
-      setNet(v => ({ ...v, screen: null, peerStatus: "connected", statusMsg: "", timeControlId: gameClock }));
+      if (from) s.netPeerId = from;
+      setNet((v) => ({ ...v, screen: null, peerStatus: "connected", statusMsg: "", timeControlId: gameClock, outgoingChallenge: null, incomingChallenge: null }));
       startGameRef.current?.("net", myColor, gameClock);
       return;
     }
 
+    if (from && s.netPeerId && from !== s.netPeerId) return;
+
     if (data.type === "move") {
-      // Apply opponent's move — guard: only when it is genuinely their turn
       if (s.mode !== "net" || s.turn === s.playerColor) return;
-      // Basic sanity check on the payload before touching game state
-      const { from, to } = data;
-      if (!Array.isArray(from) || !Array.isArray(to)) return;
-      if (from.length < 2 || to.length < 2) return;
-      doMove(from, to, { relay: false });
+      const { from: mvFrom, to } = data;
+      if (!Array.isArray(mvFrom) || !Array.isArray(to)) return;
+      if (mvFrom.length < 2 || to.length < 2) return;
+      doMove(mvFrom, to, { relay: false });
       return;
     }
 
@@ -1074,7 +1459,7 @@ function Chess3D() {
         data?.color === W || data?.color === B
           ? data.color
           : (s.playerColor === W ? B : W);
-      setNet(v => ({ ...v, statusMsg: "Opponent resigned" }));
+      setNet((v) => ({ ...v, statusMsg: "Opponent resigned" }));
       resignGame(resignedColor, { relay: false });
       return;
     }
@@ -1084,11 +1469,27 @@ function Chess3D() {
         data?.color === W || data?.color === B
           ? data.color
           : (s.playerColor === W ? B : W);
-      setNet(v => ({ ...v, statusMsg: "Opponent flagged on time" }));
+      setNet((v) => ({ ...v, statusMsg: "Opponent flagged on time" }));
       timeoutGame(flaggedColor, { relay: false });
       return;
     }
   };
+
+  useEffect(() => {
+    let saved = "";
+    try {
+      saved = window.localStorage.getItem(NAME_STORAGE_KEY) || "";
+    } catch {}
+    if (saved) {
+      setNet((v) => ({ ...v, nameInput: v.nameInput || saved }));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (ui.mode === "net" && (ui.status === "checkmate" || ui.status === "stalemate" || ui.status === "resigned" || ui.status === "timeout")) {
+      setPresenceStatus("lobby");
+    }
+  }, [ui.mode, ui.status, setPresenceStatus]);
 
   // ── UI helpers ─────────────────────────────────────────────────────────────
 
@@ -1161,6 +1562,13 @@ function Chess3D() {
     ...serverInputStyle,
     appearance: "none",
     cursor: "pointer",
+  };
+  const nameInputStyle = {
+    ...serverInputStyle,
+    fontFamily: "'Palatino Linotype', Palatino, serif",
+    fontWeight: "normal",
+    textTransform: "none",
+    letterSpacing: "0.01em",
   };
 
   return (
@@ -1256,8 +1664,9 @@ function Chess3D() {
           {ui.mode && !isOver && btn("🏳 Resign", () => resignGame(), "#6a1f1f")}
           {ui.mode && btn("⟵ Menu", () => {
             disconnectNet();
+            setPresenceStatus("lobby");
             const s = sr.current; s.mode = null; s.status = "idle";
-            setNet(v => ({ ...v, screen: null, peerStatus: "" }));
+            setNet(v => ({ ...v, screen: null, peerStatus: "", incomingChallenge: null, outgoingChallenge: null }));
             setUi(v => ({ ...v, mode: null, status: "idle" }));
           }, "#2a2010")}
           {ui.mode && ui.mode !== "net" && btn("↺ Restart", () => startGame(ui.mode, ui.playerColor, ui.timeControlId), "#1a2a1a")}
@@ -1267,8 +1676,35 @@ function Chess3D() {
       {/* 3D Viewport */}
       <div ref={mountRef} style={{ flex: 1, width: "100%", position: "relative" }} />
 
+      {!net.nameReady && (
+        <div style={overlayStyle}>
+          <div style={cardStyle}>
+            <h2 style={{ margin: "0 0 10px", color: "#d4a843", fontSize: "1.7em" }}>Choose Your Name</h2>
+            <p style={{ color: "#6a5a3a", margin: "0 0 18px", fontSize: "0.86em" }}>
+              This name is shown in the online lobby and challenge list.
+            </p>
+            {net.error && (
+              <div style={{ color: "#ff8888", background: "rgba(80,0,0,0.4)", border: "1px solid #aa3333", borderRadius: "8px", padding: "8px 14px", marginBottom: "14px", fontSize: "0.85em" }}>
+                {net.error}
+              </div>
+            )}
+            <input
+              style={nameInputStyle}
+              placeholder="Your name"
+              maxLength={24}
+              value={net.nameInput}
+              onChange={e => setNet(v => ({ ...v, nameInput: e.target.value, error: "" }))}
+              onKeyDown={e => e.key === "Enter" && net.presenceState !== "connecting" && submitName()}
+            />
+            <div style={{ marginTop: "16px" }}>
+              {btn(net.presenceState === "connecting" ? "Connecting..." : "Continue", () => { if (net.presenceState !== "connecting") submitName(); }, "#1a3a2a", { minWidth: "170px" })}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Main Menu ── */}
-      {!ui.mode && !net.screen && (
+      {net.nameReady && !ui.mode && !net.screen && (
         <div style={overlayStyle}>
           <div style={cardStyle}>
             <div style={{ fontSize: "4em", marginBottom: "4px", filter: "drop-shadow(0 0 12px #d4a84388)" }}>♟</div>
@@ -1293,7 +1729,7 @@ function Chess3D() {
               {btn("⚪  Play as White vs AI", () => startGame("pvai", W, net.timeControlId), "#1a3a1a")}
               {btn("⚫  Play as Black vs AI", () => startGame("pvai", B, net.timeControlId), "#1a1a3a")}
               <div style={{ borderTop: "1px solid #2a1f0a", margin: "4px 0" }} />
-              {btn("🌐  Play Online", () => setNet(v => ({ ...v, screen: "lobby", inputCode: "", error: "" })), "#1a2040")}
+              {btn("🌐  Play Online", () => openOnlineLobby(), "#1a2040")}
             </div>
             <p style={{ color: "#3a3020", margin: "22px 0 0", fontSize: "0.75em" }}>
               AI plays random legal moves — improve it yourself!
@@ -1305,47 +1741,82 @@ function Chess3D() {
       {/* ── Online Lobby ── */}
       {net.screen === "lobby" && (
         <div style={overlayStyle}>
-          <div style={cardStyle}>
-            <h2 style={{ margin: "0 0 6px", color: "#d4a843", fontSize: "1.6em" }}>🌐 Play Online</h2>
-            <p style={{ color: "#6a5a3a", margin: "0 0 28px", fontSize: "0.82em" }}>
-              Create a room and share the code, or join a friend's room.
+          <div style={{ ...cardStyle, minWidth: "560px", maxWidth: "760px", width: "92vw" }}>
+            <h2 style={{ margin: "0 0 6px", color: "#d4a843", fontSize: "1.6em" }}>🌐 Online Lobby</h2>
+            <p style={{ color: "#6a5a3a", margin: "0 0 18px", fontSize: "0.82em" }}>
+              Signed in as <strong>{net.playerName || "Player"}</strong> · {net.presenceState === "online" ? "connected" : net.presenceState}
             </p>
+
             {net.error && (
-              <div style={{ color: "#ff8888", background: "rgba(80,0,0,0.4)", border: "1px solid #aa3333",
-                borderRadius: "8px", padding: "8px 14px", marginBottom: "18px", fontSize: "0.85em" }}>
+              <div style={{ color: "#ff8888", background: "rgba(80,0,0,0.4)", border: "1px solid #aa3333", borderRadius: "8px", padding: "8px 14px", marginBottom: "14px", fontSize: "0.85em" }}>
                 {net.error}
               </div>
             )}
-            <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
-              <div style={{ display: "flex", flexDirection: "column", gap: "6px", textAlign: "left" }}>
-                <div style={{ color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" }}>TIME CONTROL</div>
-                <select
-                  style={timeSelectStyle}
-                  value={net.timeControlId}
-                  onChange={e => setNet(v => ({ ...v, timeControlId: e.target.value }))}
-                >
-                  {TIME_CONTROLS.map((tc) => (
-                    <option key={tc.id} value={tc.id}>{tc.label}</option>
-                  ))}
-                </select>
-                <div style={{ color: "#6a5a3a", fontSize: "0.73em" }}>
-                  Host selection is used for both players.
+
+            {net.incomingChallenge && (
+              <div style={{ border: "1px solid #6b4f10", borderRadius: "10px", padding: "12px", marginBottom: "14px", background: "rgba(60,40,10,0.35)" }}>
+                <div style={{ color: "#f0d9b5", marginBottom: "8px", fontSize: "0.94em" }}>
+                  Challenge from <strong>{net.incomingChallenge.fromName}</strong> ({resolveTimeControl(net.incomingChallenge.timeControlId).label})
+                </div>
+                <div style={{ display: "flex", gap: "10px", justifyContent: "center" }}>
+                  {btn("Accept", () => acceptChallenge(), "#1a3a2a", { fontSize: "0.84em", padding: "8px 14px" })}
+                  {btn("Decline", () => declineChallenge(), "#5a1f1f", { fontSize: "0.84em", padding: "8px 14px" })}
                 </div>
               </div>
-              {btn("♟  Host a Game (play as White)", () => hostGame(net.timeControlId), "#1a3a2a")}
-              <div style={{ borderTop: "1px solid #2a1f0a", margin: "2px 0" }} />
-              <input
-                style={inputStyle}
-                placeholder="ROOM CODE"
-                maxLength={6}
-                value={net.inputCode}
-                onChange={e => setNet(v => ({ ...v, inputCode: e.target.value.toUpperCase(), error: "" }))}
-                onKeyDown={e => e.key === "Enter" && joinGame(net.inputCode)}
-              />
-              {btn("Join Game", () => joinGame(net.inputCode), "#1a2a3a")}
+            )}
+
+            {net.outgoingChallenge && (
+              <div style={{ border: "1px solid #2a5f9f", borderRadius: "10px", padding: "10px", marginBottom: "14px", background: "rgba(25,45,75,0.35)", color: "#9bc2ff", fontSize: "0.84em" }}>
+                Waiting for <strong>{net.outgoingChallenge.toName}</strong> to accept your challenge...
+              </div>
+            )}
+
+            <div style={{ display: "flex", flexDirection: "column", gap: "6px", textAlign: "left", marginBottom: "10px" }}>
+              <div style={{ color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" }}>TIME CONTROL (for your outgoing challenge)</div>
+              <select
+                style={timeSelectStyle}
+                value={net.timeControlId}
+                onChange={e => setNet(v => ({ ...v, timeControlId: e.target.value, error: "" }))}
+              >
+                {TIME_CONTROLS.map((tc) => (
+                  <option key={tc.id} value={tc.id}>{tc.label}</option>
+                ))}
+              </select>
             </div>
-            <div style={{ marginTop: "20px" }}>
-              {btn("← Back", () => setNet(v => ({ ...v, screen: null })), "#2a2010", { fontSize: "0.85em", padding: "8px 18px" })}
+
+            <div style={{ border: "1px solid #2a1f0a", borderRadius: "10px", overflow: "hidden", background: "rgba(0,0,0,0.22)" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr auto", padding: "9px 12px", borderBottom: "1px solid #2a1f0a", color: "#8a7a58", fontSize: "0.76em", letterSpacing: "0.04em" }}>
+                <div>PLAYER</div>
+                <div>STATUS / ACTION</div>
+              </div>
+              <div style={{ maxHeight: "280px", overflowY: "auto" }}>
+                {net.onlinePlayers.length <= 1 ? (
+                  <div style={{ padding: "14px 12px", color: "#7d6e4f", fontSize: "0.84em" }}>
+                    No other players online yet.
+                  </div>
+                ) : (
+                  net.onlinePlayers.map((player) => (
+                    <div key={player.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", gap: "10px", padding: "10px 12px", borderTop: "1px solid rgba(255,255,255,0.04)" }}>
+                      <div style={{ textAlign: "left" }}>
+                        <div style={{ color: "#f0d9b5", fontSize: "0.93em" }}>
+                          {player.name}{player.isSelf ? " (You)" : ""}
+                        </div>
+                        <div style={{ color: "#7d6e4f", fontSize: "0.75em" }}>{player.id.slice(0, 8)}</div>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                        <span style={{ color: normalizePresenceStatus(player.status) === "playing" ? "#f39a9a" : "#8fd39a", fontSize: "0.8em", minWidth: "72px", textAlign: "right" }}>
+                          {presenceLabel(player.status)}
+                        </span>
+                        {!player.isSelf && btn("Challenge", () => challengePlayer(player.id), "#1a3a2a", { fontSize: "0.8em", padding: "7px 12px" })}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            <div style={{ marginTop: "16px" }}>
+              {btn("← Back", () => setNet(v => ({ ...v, screen: null, error: "" })), "#2a2010", { fontSize: "0.85em", padding: "8px 18px" })}
             </div>
           </div>
         </div>
@@ -1361,7 +1832,7 @@ function Chess3D() {
               Clock: {resolveTimeControl(net.timeControlId).label}
             </div>
             <p style={{ color: "#6a5a3a", margin: "0 0 22px", fontSize: "0.84em" }}>
-              Share this code with your opponent:
+              Waiting for opponent to join this game:
             </p>
             <div style={{
               fontSize: "2.8em", fontFamily: "monospace", fontWeight: "bold",
@@ -1375,7 +1846,7 @@ function Chess3D() {
             <div style={{ color: "#888", fontSize: "0.8em", marginBottom: "22px", animation: "pulse 2s ease-in-out infinite" }}>
               {net.statusMsg || "Waiting for someone to join…"}
             </div>
-            {btn("Cancel", () => { disconnectNet(); setNet(v => ({ ...v, screen: "lobby" })); }, "#3a1010", { fontSize: "0.85em", padding: "8px 18px" })}
+            {btn("Cancel", () => { disconnectNet(); setPresenceStatus("lobby"); setNet(v => ({ ...v, screen: "lobby", outgoingChallenge: null })); }, "#3a1010", { fontSize: "0.85em", padding: "8px 18px" })}
           </div>
         </div>
       )}
@@ -1393,7 +1864,7 @@ function Chess3D() {
             <div style={{ color: "#a09070", fontSize: "0.88em", marginBottom: "22px" }}>
               {net.statusMsg || "Connecting…"}
             </div>
-            {btn("Cancel", () => { disconnectNet(); setNet(v => ({ ...v, screen: "lobby" })); }, "#3a1010", { fontSize: "0.85em", padding: "8px 18px" })}
+            {btn("Cancel", () => { disconnectNet(); setPresenceStatus("lobby"); setNet(v => ({ ...v, screen: "lobby", outgoingChallenge: null })); }, "#3a1010", { fontSize: "0.85em", padding: "8px 18px" })}
           </div>
         </div>
       )}
@@ -1411,11 +1882,12 @@ function Chess3D() {
               The connection to your opponent was lost.
             </p>
             <div style={{ display: "flex", gap: "12px", justifyContent: "center" }}>
-              {btn("🌐 Play Again Online", () => setNet(v => ({ ...v, screen: "lobby", peerStatus: "", error: "" })), "#1a2040")}
+              {btn("🌐 Play Again Online", () => { setPresenceStatus("lobby"); setNet(v => ({ ...v, screen: "lobby", peerStatus: "", error: "", outgoingChallenge: null, incomingChallenge: null })); }, "#1a2040")}
               {btn("⟵ Main Menu", () => {
                 disconnectNet();
+                setPresenceStatus("lobby");
                 const s = sr.current; s.mode = null; s.status = "idle";
-                setNet(v => ({ ...v, screen: null, peerStatus: "" }));
+                setNet(v => ({ ...v, screen: null, peerStatus: "", incomingChallenge: null, outgoingChallenge: null }));
                 setUi(v => ({ ...v, mode: null, status: "idle" }));
               }, "#2a2010")}
             </div>
@@ -1443,8 +1915,9 @@ function Chess3D() {
               {ui.mode !== "net" && btn("↺ Play Again", () => startGame(ui.mode, ui.playerColor, ui.timeControlId), "#1a3a1a")}
               {btn("⟵ Menu", () => {
                 disconnectNet();
+                setPresenceStatus("lobby");
                 const s = sr.current; s.mode = null; s.status = "idle";
-                setNet(v => ({ ...v, screen: null, peerStatus: "" }));
+                setNet(v => ({ ...v, screen: null, peerStatus: "", incomingChallenge: null, outgoingChallenge: null }));
                 setUi(v => ({ ...v, mode: null, status: "idle" }));
               }, "#3a1a1a")}
             </div>
