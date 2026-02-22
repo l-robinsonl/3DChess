@@ -1,58 +1,6 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
-const PRESENCE_APP = "chess3d";
-const PRESENCE_ROOM = "lobby";
-const NAME_STORAGE_KEY = "chess3d_player_name";
-const STOCKFISH_WORKER_PATH = "./stockfish-18-lite-single.js";
-const DEFAULT_STOCKFISH_DEPTH = 10;
-const STOCKFISH_DEPTH_MIN = 1;
-const STOCKFISH_DEPTH_MAX = 20;
-const AI_MODE_RANDOM = "random";
-const AI_MODE_STOCKFISH = "stockfish";
-
-const AI_PRESETS = [
-  { id: "custom", label: "Custom Engine", limitStrength: false, skill: 20, elo: null, note: "No strength cap." },
-  { id: "beginner", label: "Beginner Bot (~900)", limitStrength: true, skill: 2, elo: 900, note: "Good for learning." },
-  { id: "club", label: "Club Bot (~1500)", limitStrength: true, skill: 8, elo: 1500, note: "Solid club level." },
-  { id: "master", label: "Master Bot (~2200)", limitStrength: true, skill: 16, elo: 2200, note: "Strong tactical play." },
-  { id: "magnus", label: "Magnus Bot (Approx)", limitStrength: false, skill: 20, elo: null, note: "Very strong Stockfish preset (not real Magnus)." },
-];
-
-const AI_PRESET_MAP = Object.fromEntries(AI_PRESETS.map((preset) => [preset.id, preset]));
-
-const AI_LEVELS = [
-  { id: "pathetic", label: "Pathetic", mode: AI_MODE_RANDOM, preset: "custom", depth: 1, note: "Pure random legal moves." },
-  { id: "novice", label: "Novice", mode: AI_MODE_STOCKFISH, preset: "beginner", depth: 4, note: "Makes obvious mistakes." },
-  { id: "easy", label: "Easy", mode: AI_MODE_STOCKFISH, preset: "beginner", depth: 6, note: "Beginner-friendly Stockfish." },
-  { id: "medium", label: "Medium", mode: AI_MODE_STOCKFISH, preset: "club", depth: 9, note: "Club-level challenge." },
-  { id: "hard", label: "Hard", mode: AI_MODE_STOCKFISH, preset: "master", depth: 12, note: "Very sharp tactically." },
-  { id: "brutal", label: "Brutal", mode: AI_MODE_STOCKFISH, preset: "custom", depth: 16, note: "Strong unrestricted engine." },
-  { id: "magnus", label: "Magnus (Approx)", mode: AI_MODE_STOCKFISH, preset: "magnus", depth: 20, note: "Maximum strength preset, not real Magnus." },
-];
-
-const AI_LEVEL_MAP = Object.fromEntries(AI_LEVELS.map((level) => [level.id, level]));
-
-function clampStockfishDepth(depth) {
-  const parsed = Number(depth);
-  if (!Number.isFinite(parsed)) return DEFAULT_STOCKFISH_DEPTH;
-  return Math.max(STOCKFISH_DEPTH_MIN, Math.min(STOCKFISH_DEPTH_MAX, Math.floor(parsed)));
-}
-
-function resolveAiPreset(id) {
-  return AI_PRESET_MAP[id] ?? AI_PRESET_MAP.custom;
-}
-
-function resolveAiLevel(id) {
-  return AI_LEVEL_MAP[id] ?? AI_LEVEL_MAP.pathetic;
-}
-
-function normalizePresenceStatus(status) {
-  return status === "playing" ? "playing" : "lobby";
-}
-
-function presenceLabel(status) {
-  return normalizePresenceStatus(status) === "playing" ? "playing" : "in lobby";
-}
+// Shared constants/helpers are loaded from chess-config.js
 // ─── Main Component ───────────────────────────────────────────────────────────
 
 function Chess3D() {
@@ -65,7 +13,7 @@ function Chess3D() {
     ep: null, // en passant square
     mode: null, // 'pvp' | 'pvai'
     playerColor: W,
-    status: "idle", // idle | playing | check | checkmate | stalemate | resigned | timeout
+    status: "idle", // idle | playing | check | checkmate | stalemate | draw | resigned | timeout
     timeControlId: "blitz",
     clockIncrementMs: 0,
     clockMs: { [W]: null, [B]: null },
@@ -76,6 +24,9 @@ function Chess3D() {
     openingWhite: "Start Position",
     openingBlack: "Awaiting White move",
     lastOpponentMove: null,
+    drawReason: null,
+    pendingPromotion: null,
+    positionCounts: new Map(),
     aiMode: AI_MODE_RANDOM,
     aiDepth: DEFAULT_STOCKFISH_DEPTH,
     aiPreset: "custom",
@@ -121,6 +72,8 @@ function Chess3D() {
     aiLevelId: "pathetic",
     openingWhite: "Start Position",
     openingBlack: "Awaiting White move",
+    drawReason: null,
+    promotion: null,
   });
   const [net, setNet] = useState({
     screen: null,      // null | "lobby" | "waiting" | "joining"
@@ -168,6 +121,14 @@ function Chess3D() {
       aiLevelId: s.aiLevelId,
       openingWhite: s.openingWhite,
       openingBlack: s.openingBlack,
+      drawReason: s.drawReason || null,
+      promotion: s.pendingPromotion
+        ? {
+            color: s.pendingPromotion.color,
+            from: [...s.pendingPromotion.from],
+            to: [...s.pendingPromotion.to],
+          }
+        : null,
     });
   }, []);
 
@@ -537,21 +498,23 @@ function Chess3D() {
     // Black captured white pieces → left flank
     placeGraveyard(s.captured[B], W, -FLANK_X);
   }, []);
-  const updateStatus = useCallback((board, turn, ep) => {
-    const moves = allLegalMoves(board, turn, ep);
-    if (moves.length === 0) return isInCheck(board, turn) ? "checkmate" : "stalemate";
-    if (isInCheck(board, turn)) return "check";
-    return "playing";
+  const updateStatus = useCallback((board, turn, ep, halfmoveClock, positionCounts) => {
+    return evaluateGameStatus(board, turn, ep, {
+      halfmoveClock,
+      positionCounts,
+    });
   }, []);
 
   const timeoutGame = useCallback((flaggedColor, { relay = true } = {}) => {
     const s = sr.current;
     if (!s.mode) return;
-    if (s.status === "checkmate" || s.status === "stalemate" || s.status === "resigned" || s.status === "timeout") return;
+    if (isTerminalStatus(s.status)) return;
     const color = flaggedColor === W || flaggedColor === B ? flaggedColor : s.turn;
 
     s.turn = color; // side that flagged
     s.status = "timeout";
+    s.drawReason = null;
+    s.pendingPromotion = null;
     s.selected = null;
     s.legalMovesList = [];
     s.aiThinking = false;
@@ -607,10 +570,10 @@ function Chess3D() {
   }, [timeoutGame]);
 
   // Execute a move on the state
-  const doMove = useCallback((from, to, { relay = true } = {}) => {
+  const doMove = useCallback((from, to, { relay = true, promotion = null } = {}) => {
     const s = sr.current;
     tickClock(performance.now(), { relayOnTimeout: relay });
-    if (s.status === "timeout") return false;
+    if (isTerminalStatus(s.status)) return false;
 
     if (!Array.isArray(from) || !Array.isArray(to)) return false;
 
@@ -631,6 +594,27 @@ function Chess3D() {
     });
     if (!legal) return false;
 
+    const isPromotionMove = piece.type === P.PAWN && (legal[0] === 0 || legal[0] === 7);
+    const localHumanMove =
+      s.mode === "pvp" ||
+      ((s.mode === "net" || s.mode === "pvai") && piece.color === s.playerColor);
+
+    if (isPromotionMove && promotion == null && localHumanMove) {
+      s.pendingPromotion = {
+        from: [fr, fc],
+        to: [legal[0], legal[1], typeof legal[2] === "string" ? legal[2] : null],
+        relay,
+        color: piece.color,
+      };
+      s.selected = null;
+      s.legalMovesList = [];
+      syncHighlights();
+      refresh();
+      return false;
+    }
+
+    const promotionType = isPromotionMove ? normalizePromotionType(promotion) : null;
+
     const movedByOpponent =
       (s.mode === "net" || s.mode === "pvai") && piece.color !== s.playerColor;
     if (movedByOpponent) {
@@ -642,8 +626,8 @@ function Chess3D() {
     const epPiece  = isEP ? s.board[fr][legal[1]] : null;
     const isCapture = !!(captured || isEP);
     const isCastle = legal[2] === "castleK" || legal[2] === "castleQ";
-    const newBoard = applyMove(s.board, [fr, fc], legal, s.ep);
-    const uciMove = moveToUci([fr, fc], legal, piece);
+    const newBoard = applyMove(s.board, [fr, fc], legal, s.ep, promotionType);
+    const uciMove = moveToUci([fr, fc], legal, piece, promotionType);
 
     // Track captures — attacker colour captures the victim
     if (captured) s.captured[piece.color].push({ type: captured.type, color: captured.color });
@@ -669,8 +653,16 @@ function Chess3D() {
     s.turn = s.turn === W ? B : W;
     s.selected = null;
     s.legalMovesList = [];
-    const newStatus = updateStatus(newBoard, s.turn, newEp);
+    s.pendingPromotion = null;
+
+    const key = positionKey(newBoard, s.turn, newEp);
+    s.positionCounts.set(key, (s.positionCounts.get(key) ?? 0) + 1);
+
+    const gameStatus = updateStatus(newBoard, s.turn, newEp, s.halfmoveClock, s.positionCounts);
+    const newStatus = gameStatus.status;
     s.status = newStatus;
+    s.drawReason = gameStatus.drawReason;
+
     if (s.timeControlId !== "casual") {
       if (typeof s.clockMs[piece.color] === "number" && s.clockIncrementMs > 0) {
         s.clockMs[piece.color] += s.clockIncrementMs;
@@ -680,7 +672,7 @@ function Chess3D() {
 
     // Sounds
     if (newStatus === "checkmate")      Sounds.checkmate();
-    else if (newStatus === "stalemate") Sounds.stalemate();
+    else if (newStatus === "stalemate" || newStatus === "draw") Sounds.stalemate();
     else if (newStatus === "check")     Sounds.check();
     else if (isCastle)                  Sounds.castle();
     else if (isCapture)                 Sounds.capture();
@@ -688,7 +680,12 @@ function Chess3D() {
 
     // Broadcast to peer in net mode
     if (relay && s.mode === "net" && s.netClient && s.netPeerId) {
-      s.netClient.sendTo(s.netPeerId, { type: "move", from: [fr, fc], to: legal });
+      s.netClient.sendTo(s.netPeerId, {
+        type: "move",
+        from: [fr, fc],
+        to: legal,
+        promotion: promotionType,
+      });
     }
 
     syncBoard();
@@ -702,7 +699,7 @@ function Chess3D() {
   const resignGame = useCallback((resigningColor = null, { relay = true } = {}) => {
     const s = sr.current;
     if (!s.mode) return;
-    if (s.status === "checkmate" || s.status === "stalemate" || s.status === "resigned" || s.status === "timeout") return;
+    if (isTerminalStatus(s.status)) return;
 
     const color =
       resigningColor === W || resigningColor === B
@@ -711,6 +708,8 @@ function Chess3D() {
 
     s.turn = color; // side that resigned
     s.status = "resigned";
+    s.drawReason = null;
+    s.pendingPromotion = null;
     s.selected = null;
     s.legalMovesList = [];
     s.aiThinking = false;
@@ -731,7 +730,7 @@ function Chess3D() {
 
   const aiMove = useCallback(() => {
     const s = sr.current;
-    if (s.status === "checkmate" || s.status === "stalemate" || s.status === "resigned" || s.status === "timeout") return;
+    if (isTerminalStatus(s.status)) return;
 
     const moves = allLegalMoves(s.board, s.turn, s.ep);
     if (!moves.length) return;
@@ -759,10 +758,7 @@ function Chess3D() {
         const cur = sr.current;
         return (
           cur.aiThinkToken !== thinkToken ||
-          cur.status === "checkmate" ||
-          cur.status === "stalemate" ||
-          cur.status === "resigned" ||
-          cur.status === "timeout" ||
+          isTerminalStatus(cur.status) ||
           cur.turn === cur.playerColor
         );
       };
@@ -815,9 +811,24 @@ function Chess3D() {
       sr.current.aiThinking = false;
       setUi((v) => ({ ...v, aiThinking: false }));
 
-      if (chosenMove) doMove(chosenMove.from, chosenMove.to);
+      if (chosenMove) doMove(chosenMove.from, chosenMove.to, { promotion: chosenMove.promotionType ?? null });
     }, delay);
   }, [doMove, requestStockfishBestMove]);
+
+  const completePromotion = useCallback((nextType) => {
+    const s = sr.current;
+    const pending = s.pendingPromotion;
+    if (!pending) return;
+
+    const moved = doMove(pending.from, pending.to, {
+      relay: pending.relay,
+      promotion: normalizePromotionType(nextType),
+    });
+
+    if (moved && s.mode === "pvai" && !isTerminalStatus(s.status) && s.turn !== s.playerColor) {
+      aiMove();
+    }
+  }, [doMove, aiMove]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -836,7 +847,7 @@ function Chess3D() {
   // Click handler — stored in ref so event listeners always call latest
   handleClickRef.current = useCallback((e) => {
     const s = sr.current;
-    if (!s.mode || s.status === "checkmate" || s.status === "stalemate" || s.status === "resigned" || s.status === "timeout") return;
+    if (!s.mode || isTerminalStatus(s.status) || s.pendingPromotion) return;
     if (s.mode === "pvai" && s.turn !== s.playerColor) return;
     if (s.mode === "net"  && s.turn !== s.playerColor) return;
 
@@ -858,9 +869,9 @@ function Chess3D() {
       const [sr2, sc] = s.selected;
       const legal = s.legalMovesList.find(([mr, mc]) => mr === row && mc === col);
       if (legal) {
-        doMove([sr2, sc], legal);
+        const moved = doMove([sr2, sc], legal);
         // Trigger AI after player move — aiMove handles its own delay
-        if (s.mode === "pvai" && s.status !== "checkmate" && s.status !== "stalemate" && s.status !== "resigned" && s.status !== "timeout") {
+        if (moved && s.mode === "pvai" && !isTerminalStatus(s.status) && s.turn !== s.playerColor) {
           aiMove();
         }
       } else {
@@ -1498,7 +1509,7 @@ function Chess3D() {
       setNet((v) => ({
         ...v,
         presenceState: "offline",
-        error: `Could not connect online lobby: ${e.message}`,
+        error: `Could not connect online lobby: ${formatSignalError(e, getSignalUrl())}`,
         statusMsg: "",
       }));
       return false;
@@ -1581,7 +1592,7 @@ function Chess3D() {
       await client.connect();
       return true;
     } catch (e) {
-      setNet((v) => ({ ...v, screen: "lobby", error: `Could not reach signaling server: ${e.message}`, statusMsg: "" }));
+      setNet((v) => ({ ...v, screen: "lobby", error: `Could not reach signaling server: ${formatSignalError(e, signalUrl)}`, statusMsg: "" }));
       disconnectNet();
       return false;
     }
@@ -1628,7 +1639,7 @@ function Chess3D() {
       await client.connect();
       return true;
     } catch (e) {
-      setNet((v) => ({ ...v, screen: "lobby", error: `Could not reach signaling server: ${e.message}`, statusMsg: "" }));
+      setNet((v) => ({ ...v, screen: "lobby", error: `Could not reach signaling server: ${formatSignalError(e, signalUrl)}`, statusMsg: "" }));
       disconnectNet();
       return false;
     }
@@ -1733,6 +1744,7 @@ function Chess3D() {
     s.mode = mode;
     s.playerColor = playerColor;
     s.status = "playing";
+    s.drawReason = null;
     s.timeControlId = timeControl.id;
     s.clockIncrementMs = timeControl.incrementMs;
     s.clockMs =
@@ -1749,6 +1761,9 @@ function Chess3D() {
     s.openingWhite = opening.white;
     s.openingBlack = opening.black;
     s.lastOpponentMove = null;
+    s.pendingPromotion = null;
+    s.positionCounts = new Map();
+    s.positionCounts.set(positionKey(s.board, s.turn, s.ep), 1);
 
     s.aiMode = nextAiMode;
     s.aiDepth = nextAiDepth;
@@ -1866,10 +1881,10 @@ function Chess3D() {
 
     if (data.type === "move") {
       if (s.mode !== "net" || s.turn === s.playerColor) return;
-      const { from: mvFrom, to } = data;
+      const { from: mvFrom, to, promotion } = data;
       if (!Array.isArray(mvFrom) || !Array.isArray(to)) return;
       if (mvFrom.length < 2 || to.length < 2) return;
-      doMove(mvFrom, to, { relay: false });
+      doMove(mvFrom, to, { relay: false, promotion });
       return;
     }
 
@@ -1905,7 +1920,7 @@ function Chess3D() {
   }, []);
 
   useEffect(() => {
-    if (ui.mode === "net" && (ui.status === "checkmate" || ui.status === "stalemate" || ui.status === "resigned" || ui.status === "timeout")) {
+    if (ui.mode === "net" && isTerminalStatus(ui.status)) {
       setPresenceStatus("lobby");
     }
   }, [ui.mode, ui.status, setPresenceStatus]);
@@ -1916,6 +1931,7 @@ function Chess3D() {
   const statusMsg = () => {
     if (ui.status === "checkmate") return `☠ Checkmate — ${ui.turn === W ? "Black" : "White"} wins!`;
     if (ui.status === "stalemate") return "🤝 Stalemate — Draw";
+    if (ui.status === "draw") return `🤝 Draw — ${drawReasonLabel(ui.drawReason)}`;
     if (ui.status === "resigned") return `🏳 ${ui.turn === W ? "White" : "Black"} resigned — ${ui.turn === W ? "Black" : "White"} wins!`;
     if (ui.status === "timeout") return `⏰ ${ui.turn === W ? "White" : "Black"} flagged — ${ui.turn === W ? "Black" : "White"} wins!`;
     if (ui.status === "check") return `⚠ ${turnLabel} is in Check!`;
@@ -1928,11 +1944,7 @@ function Chess3D() {
     return "";
   };
 
-  const isOver =
-    ui.status === "checkmate" ||
-    ui.status === "stalemate" ||
-    ui.status === "resigned" ||
-    ui.status === "timeout";
+  const isOver = isTerminalStatus(ui.status);
   const activeTimeControl = resolveTimeControl(ui.timeControlId);
   const hasClock = activeTimeControl.initialMs != null;
   const currentAiPreset = resolveAiPreset(ui.aiPreset);
@@ -1995,6 +2007,13 @@ function Chess3D() {
     textTransform: "none",
     letterSpacing: "0.01em",
   };
+
+  const promotionOptions = [
+    { type: P.QUEEN, label: "Queen", white: "♕", black: "♛" },
+    { type: P.ROOK, label: "Rook", white: "♖", black: "♜" },
+    { type: P.BISHOP, label: "Bishop", white: "♗", black: "♝" },
+    { type: P.KNIGHT, label: "Knight", white: "♘", black: "♞" },
+  ];
 
   return (
     <div style={{
@@ -2122,6 +2141,43 @@ function Chess3D() {
 
       {/* 3D Viewport */}
       <div ref={mountRef} style={{ flex: 1, width: "100%", position: "relative" }} />
+
+      {ui.mode && ui.promotion && (
+        <div style={overlayStyle}>
+          <div style={{ ...cardStyle, minWidth: "420px", maxWidth: "460px" }}>
+            <h2 style={{ margin: "0 0 10px", color: "#d4a843", fontSize: "1.55em" }}>Choose Promotion</h2>
+            <p style={{ color: "#7d6e4f", margin: "0 0 16px", fontSize: "0.82em" }}>
+              Select the piece your pawn becomes.
+            </p>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(140px, 1fr))", gap: "10px" }}>
+              {promotionOptions.map((opt) => (
+                <button
+                  key={opt.type}
+                  onClick={() => completePromotion(opt.type)}
+                  style={{
+                    padding: "12px 14px",
+                    borderRadius: "10px",
+                    border: "1px solid #6b4f10",
+                    background: "rgba(18,27,42,0.9)",
+                    color: "#f0d9b5",
+                    cursor: "pointer",
+                    fontFamily: "'Palatino Linotype', Palatino, serif",
+                    fontWeight: "bold",
+                    fontSize: "0.95em",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: "8px",
+                  }}
+                >
+                  <span style={{ fontSize: "1.3em" }}>{ui.promotion.color === W ? opt.white : opt.black}</span>
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {!net.nameReady && (
         <div style={overlayStyle}>

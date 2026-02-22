@@ -3,6 +3,28 @@
 const P = { PAWN: "P", ROOK: "R", KNIGHT: "N", BISHOP: "B", QUEEN: "Q", KING: "K" };
 const W = "w", B = "b";
 
+const PROMOTION_TYPES = [P.QUEEN, P.ROOK, P.BISHOP, P.KNIGHT];
+const PROMOTION_TO_UCI = {
+  [P.QUEEN]: "q",
+  [P.ROOK]: "r",
+  [P.BISHOP]: "b",
+  [P.KNIGHT]: "n",
+};
+const UCI_TO_PROMOTION = {
+  q: P.QUEEN,
+  r: P.ROOK,
+  b: P.BISHOP,
+  n: P.KNIGHT,
+};
+
+function normalizePromotionType(type) {
+  return PROMOTION_TYPES.includes(type) ? type : P.QUEEN;
+}
+
+function promotionTypeToUci(type) {
+  return PROMOTION_TO_UCI[normalizePromotionType(type)] ?? "q";
+}
+
 const TIME_CONTROLS = [
   { id: "casual", label: "Casual (No Clock)", initialMs: null, incrementMs: 0 },
   { id: "bullet", label: "Bullet 1+0", initialMs: 60_000, incrementMs: 0 },
@@ -60,16 +82,16 @@ function squareToCoord(square) {
   return [r, c];
 }
 
-function moveToUci(from, to, piece = null) {
+function moveToUci(from, to, piece = null, promotionType = null) {
   const fromSq = coordToSquare(from);
   const toSq = coordToSquare(to);
   if (!fromSq || !toSq) return "";
   const promote =
     piece?.type === P.PAWN &&
     (to?.[0] === 0 || to?.[0] === 7)
-      ? "q"
+      ? promotionTypeToUci(promotionType)
       : "";
-  return `${fromSq}${toSq}${promote}`;
+  return fromSq + toSq + promote;
 }
 
 function uciToMove(uci, board, ep) {
@@ -81,10 +103,15 @@ function uciToMove(uci, board, ep) {
   if (!from || !to) return null;
 
   const [fr, fc] = from;
+  const piece = board?.[fr]?.[fc];
+  if (!piece) return null;
+
+  const promotionType = text[4] ? UCI_TO_PROMOTION[text[4]] ?? null : null;
+
   const legal = legalMoves(board, fr, fc, ep).find(([mr, mc]) => mr === to[0] && mc === to[1]);
   if (!legal) return null;
 
-  return { from, to: legal };
+  return { from, to: legal, promotionType };
 }
 
 function boardToFen(board, turn, ep, halfmoveClock = 0, fullmoveNumber = 1) {
@@ -142,6 +169,12 @@ function boardToFen(board, turn, ep, halfmoveClock = 0, fullmoveNumber = 1) {
   const safeFullmove = Number.isInteger(fullmoveNumber) && fullmoveNumber >= 1 ? fullmoveNumber : 1;
 
   return `${rows.join("/")} ${safeTurn} ${castling} ${epSquare || "-"} ${safeHalfmove} ${safeFullmove}`;
+}
+
+function positionKey(board, turn, ep) {
+  const fen = boardToFen(board, turn, ep, 0, 1);
+  const parts = fen.split(" ");
+  return parts.slice(0, 4).join(" ");
 }
 
 const WHITE_OPENING_BY_FIRST_MOVE = {
@@ -352,7 +385,7 @@ function isInCheck(board, color) {
   return false;
 }
 
-function applyMove(board, from, to, ep) {
+function applyMove(board, from, to, ep, promotionType = null) {
   const nb = board.map((r) => r.map((p) => (p ? { ...p } : null)));
   const piece = { ...nb[from[0]][from[1]], moved: true };
   nb[to[0]][to[1]] = piece;
@@ -365,7 +398,7 @@ function applyMove(board, from, to, ep) {
 
   // Promotion
   if (piece.type === P.PAWN && (to[0] === 0 || to[0] === 7)) {
-    nb[to[0]][to[1]] = { type: P.QUEEN, color: piece.color, moved: true };
+    nb[to[0]][to[1]] = { type: normalizePromotionType(promotionType), color: piece.color, moved: true };
   }
 
   // Castling
@@ -402,4 +435,74 @@ function allLegalMoves(board, color, ep) {
     }
   }
   return moves;
+}
+
+function isInsufficientMaterial(board) {
+  const nonKingPieces = [];
+
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const piece = board[r][c];
+      if (!piece || piece.type === P.KING) continue;
+      nonKingPieces.push({
+        type: piece.type,
+        color: piece.color,
+        squareColor: (r + c) % 2,
+      });
+    }
+  }
+
+  if (nonKingPieces.length === 0) return true;
+
+  if (nonKingPieces.some((p) => [P.PAWN, P.ROOK, P.QUEEN].includes(p.type))) {
+    return false;
+  }
+
+  if (nonKingPieces.length === 1) {
+    return [P.BISHOP, P.KNIGHT].includes(nonKingPieces[0].type);
+  }
+
+  if (nonKingPieces.length === 2) {
+    const bishops = nonKingPieces.filter((p) => p.type === P.BISHOP);
+    const knights = nonKingPieces.filter((p) => p.type === P.KNIGHT);
+
+    if (knights.length === 2) return true;
+
+    if (bishops.length === 2) {
+      return bishops[0].squareColor === bishops[1].squareColor;
+    }
+  }
+
+  return false;
+}
+
+function evaluateGameStatus(board, turn, ep, { halfmoveClock = 0, positionCounts = null } = {}) {
+  const moves = allLegalMoves(board, turn, ep);
+  if (moves.length === 0) {
+    return {
+      status: isInCheck(board, turn) ? "checkmate" : "stalemate",
+      drawReason: null,
+    };
+  }
+
+  if (isInsufficientMaterial(board)) {
+    return { status: "draw", drawReason: "insufficient-material" };
+  }
+
+  if (halfmoveClock >= 100) {
+    return { status: "draw", drawReason: "fifty-move-rule" };
+  }
+
+  if (positionCounts instanceof Map) {
+    const key = positionKey(board, turn, ep);
+    if ((positionCounts.get(key) ?? 0) >= 3) {
+      return { status: "draw", drawReason: "threefold-repetition" };
+    }
+  }
+
+  if (isInCheck(board, turn)) {
+    return { status: "check", drawReason: null };
+  }
+
+  return { status: "playing", drawReason: null };
 }

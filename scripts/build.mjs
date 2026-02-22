@@ -10,6 +10,7 @@ const srcDir = path.join(rootDir, "src");
 const distDir = path.join(rootDir, "dist");
 
 const staticScriptFiles = [
+  "chess-config.js",
   "chess-logic.js",
   "chess-geometry.js",
   "chess-sounds.js",
@@ -66,6 +67,7 @@ const html = `<!doctype html>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/three@0.160.1/build/three.min.js"></script>
 
+    <script src="./chess-config.js"></script>
     <script src="./chess-logic.js"></script>
     <script src="./chess-geometry.js"></script>
     <script src="./chess-sounds.js"></script>

@@ -6,52 +6,6 @@
   var require_chess_app = __commonJS({
     "src/chess-app.jsx"() {
       const { useState, useEffect, useRef, useCallback } = React;
-      const PRESENCE_APP = "chess3d";
-      const PRESENCE_ROOM = "lobby";
-      const NAME_STORAGE_KEY = "chess3d_player_name";
-      const STOCKFISH_WORKER_PATH = "./stockfish-18-lite-single.js";
-      const DEFAULT_STOCKFISH_DEPTH = 10;
-      const STOCKFISH_DEPTH_MIN = 1;
-      const STOCKFISH_DEPTH_MAX = 20;
-      const AI_MODE_RANDOM = "random";
-      const AI_MODE_STOCKFISH = "stockfish";
-      const AI_PRESETS = [
-        { id: "custom", label: "Custom Engine", limitStrength: false, skill: 20, elo: null, note: "No strength cap." },
-        { id: "beginner", label: "Beginner Bot (~900)", limitStrength: true, skill: 2, elo: 900, note: "Good for learning." },
-        { id: "club", label: "Club Bot (~1500)", limitStrength: true, skill: 8, elo: 1500, note: "Solid club level." },
-        { id: "master", label: "Master Bot (~2200)", limitStrength: true, skill: 16, elo: 2200, note: "Strong tactical play." },
-        { id: "magnus", label: "Magnus Bot (Approx)", limitStrength: false, skill: 20, elo: null, note: "Very strong Stockfish preset (not real Magnus)." }
-      ];
-      const AI_PRESET_MAP = Object.fromEntries(AI_PRESETS.map((preset) => [preset.id, preset]));
-      const AI_LEVELS = [
-        { id: "pathetic", label: "Pathetic", mode: AI_MODE_RANDOM, preset: "custom", depth: 1, note: "Pure random legal moves." },
-        { id: "novice", label: "Novice", mode: AI_MODE_STOCKFISH, preset: "beginner", depth: 4, note: "Makes obvious mistakes." },
-        { id: "easy", label: "Easy", mode: AI_MODE_STOCKFISH, preset: "beginner", depth: 6, note: "Beginner-friendly Stockfish." },
-        { id: "medium", label: "Medium", mode: AI_MODE_STOCKFISH, preset: "club", depth: 9, note: "Club-level challenge." },
-        { id: "hard", label: "Hard", mode: AI_MODE_STOCKFISH, preset: "master", depth: 12, note: "Very sharp tactically." },
-        { id: "brutal", label: "Brutal", mode: AI_MODE_STOCKFISH, preset: "custom", depth: 16, note: "Strong unrestricted engine." },
-        { id: "magnus", label: "Magnus (Approx)", mode: AI_MODE_STOCKFISH, preset: "magnus", depth: 20, note: "Maximum strength preset, not real Magnus." }
-      ];
-      const AI_LEVEL_MAP = Object.fromEntries(AI_LEVELS.map((level) => [level.id, level]));
-      function clampStockfishDepth(depth) {
-        const parsed = Number(depth);
-        if (!Number.isFinite(parsed)) return DEFAULT_STOCKFISH_DEPTH;
-        return Math.max(STOCKFISH_DEPTH_MIN, Math.min(STOCKFISH_DEPTH_MAX, Math.floor(parsed)));
-      }
-      function resolveAiPreset(id) {
-        var _a;
-        return (_a = AI_PRESET_MAP[id]) != null ? _a : AI_PRESET_MAP.custom;
-      }
-      function resolveAiLevel(id) {
-        var _a;
-        return (_a = AI_LEVEL_MAP[id]) != null ? _a : AI_LEVEL_MAP.pathetic;
-      }
-      function normalizePresenceStatus(status) {
-        return status === "playing" ? "playing" : "lobby";
-      }
-      function presenceLabel(status) {
-        return normalizePresenceStatus(status) === "playing" ? "playing" : "in lobby";
-      }
       function Chess3D() {
         const mountRef = useRef(null);
         const sr = useRef({
@@ -65,7 +19,7 @@
           // 'pvp' | 'pvai'
           playerColor: W,
           status: "idle",
-          // idle | playing | check | checkmate | stalemate | resigned | timeout
+          // idle | playing | check | checkmate | stalemate | draw | resigned | timeout
           timeControlId: "blitz",
           clockIncrementMs: 0,
           clockMs: { [W]: null, [B]: null },
@@ -76,6 +30,9 @@
           openingWhite: "Start Position",
           openingBlack: "Awaiting White move",
           lastOpponentMove: null,
+          drawReason: null,
+          pendingPromotion: null,
+          positionCounts: /* @__PURE__ */ new Map(),
           aiMode: AI_MODE_RANDOM,
           aiDepth: DEFAULT_STOCKFISH_DEPTH,
           aiPreset: "custom",
@@ -125,7 +82,9 @@
           aiPreset: "custom",
           aiLevelId: "pathetic",
           openingWhite: "Start Position",
-          openingBlack: "Awaiting White move"
+          openingBlack: "Awaiting White move",
+          drawReason: null,
+          promotion: null
         });
         const [net, setNet] = useState({
           screen: null,
@@ -176,7 +135,13 @@
             aiPreset: s.aiPreset,
             aiLevelId: s.aiLevelId,
             openingWhite: s.openingWhite,
-            openingBlack: s.openingBlack
+            openingBlack: s.openingBlack,
+            drawReason: s.drawReason || null,
+            promotion: s.pendingPromotion ? {
+              color: s.pendingPromotion.color,
+              from: [...s.pendingPromotion.from],
+              to: [...s.pendingPromotion.to]
+            } : null
           });
         }, []);
         const terminateStockfish = useCallback(() => {
@@ -500,19 +465,21 @@
           placeGraveyard(s.captured[W], B, +FLANK_X);
           placeGraveyard(s.captured[B], W, -FLANK_X);
         }, []);
-        const updateStatus = useCallback((board, turn, ep) => {
-          const moves = allLegalMoves(board, turn, ep);
-          if (moves.length === 0) return isInCheck(board, turn) ? "checkmate" : "stalemate";
-          if (isInCheck(board, turn)) return "check";
-          return "playing";
+        const updateStatus = useCallback((board, turn, ep, halfmoveClock, positionCounts) => {
+          return evaluateGameStatus(board, turn, ep, {
+            halfmoveClock,
+            positionCounts
+          });
         }, []);
         const timeoutGame = useCallback((flaggedColor, { relay = true } = {}) => {
           const s = sr.current;
           if (!s.mode) return;
-          if (s.status === "checkmate" || s.status === "stalemate" || s.status === "resigned" || s.status === "timeout") return;
+          if (isTerminalStatus(s.status)) return;
           const color = flaggedColor === W || flaggedColor === B ? flaggedColor : s.turn;
           s.turn = color;
           s.status = "timeout";
+          s.drawReason = null;
+          s.pendingPromotion = null;
           s.selected = null;
           s.legalMovesList = [];
           s.aiThinking = false;
@@ -558,11 +525,11 @@
           s.clockMs[active] = next;
           return true;
         }, [timeoutGame]);
-        const doMove = useCallback((from, to, { relay = true } = {}) => {
-          var _a;
+        const doMove = useCallback((from, to, { relay = true, promotion = null } = {}) => {
+          var _a, _b;
           const s = sr.current;
           tickClock(performance.now(), { relayOnTimeout: relay });
-          if (s.status === "timeout") return false;
+          if (isTerminalStatus(s.status)) return false;
           if (!Array.isArray(from) || !Array.isArray(to)) return false;
           const fr = from[0], fc = from[1];
           const tr = to[0], tc = to[1];
@@ -577,6 +544,22 @@
             return wanted === got;
           });
           if (!legal) return false;
+          const isPromotionMove = piece.type === P.PAWN && (legal[0] === 0 || legal[0] === 7);
+          const localHumanMove = s.mode === "pvp" || (s.mode === "net" || s.mode === "pvai") && piece.color === s.playerColor;
+          if (isPromotionMove && promotion == null && localHumanMove) {
+            s.pendingPromotion = {
+              from: [fr, fc],
+              to: [legal[0], legal[1], typeof legal[2] === "string" ? legal[2] : null],
+              relay,
+              color: piece.color
+            };
+            s.selected = null;
+            s.legalMovesList = [];
+            syncHighlights();
+            refresh();
+            return false;
+          }
+          const promotionType = isPromotionMove ? normalizePromotionType(promotion) : null;
           const movedByOpponent = (s.mode === "net" || s.mode === "pvai") && piece.color !== s.playerColor;
           if (movedByOpponent) {
             s.lastOpponentMove = { from: [fr, fc], to: [legal[0], legal[1]], color: piece.color };
@@ -586,8 +569,8 @@
           const epPiece = isEP ? s.board[fr][legal[1]] : null;
           const isCapture = !!(captured || isEP);
           const isCastle = legal[2] === "castleK" || legal[2] === "castleQ";
-          const newBoard = applyMove(s.board, [fr, fc], legal, s.ep);
-          const uciMove = moveToUci([fr, fc], legal, piece);
+          const newBoard = applyMove(s.board, [fr, fc], legal, s.ep, promotionType);
+          const uciMove = moveToUci([fr, fc], legal, piece, promotionType);
           if (captured) s.captured[piece.color].push({ type: captured.type, color: captured.color });
           if (epPiece) s.captured[piece.color].push({ type: epPiece.type, color: epPiece.color });
           let newEp = null;
@@ -606,8 +589,13 @@
           s.turn = s.turn === W ? B : W;
           s.selected = null;
           s.legalMovesList = [];
-          const newStatus = updateStatus(newBoard, s.turn, newEp);
+          s.pendingPromotion = null;
+          const key = positionKey(newBoard, s.turn, newEp);
+          s.positionCounts.set(key, ((_b = s.positionCounts.get(key)) != null ? _b : 0) + 1);
+          const gameStatus = updateStatus(newBoard, s.turn, newEp, s.halfmoveClock, s.positionCounts);
+          const newStatus = gameStatus.status;
           s.status = newStatus;
+          s.drawReason = gameStatus.drawReason;
           if (s.timeControlId !== "casual") {
             if (typeof s.clockMs[piece.color] === "number" && s.clockIncrementMs > 0) {
               s.clockMs[piece.color] += s.clockIncrementMs;
@@ -615,13 +603,18 @@
             s.clockLastTickAt = performance.now();
           }
           if (newStatus === "checkmate") Sounds.checkmate();
-          else if (newStatus === "stalemate") Sounds.stalemate();
+          else if (newStatus === "stalemate" || newStatus === "draw") Sounds.stalemate();
           else if (newStatus === "check") Sounds.check();
           else if (isCastle) Sounds.castle();
           else if (isCapture) Sounds.capture();
           else Sounds.move();
           if (relay && s.mode === "net" && s.netClient && s.netPeerId) {
-            s.netClient.sendTo(s.netPeerId, { type: "move", from: [fr, fc], to: legal });
+            s.netClient.sendTo(s.netPeerId, {
+              type: "move",
+              from: [fr, fc],
+              to: legal,
+              promotion: promotionType
+            });
           }
           syncBoard();
           syncHighlights();
@@ -632,10 +625,12 @@
         const resignGame = useCallback((resigningColor = null, { relay = true } = {}) => {
           const s = sr.current;
           if (!s.mode) return;
-          if (s.status === "checkmate" || s.status === "stalemate" || s.status === "resigned" || s.status === "timeout") return;
+          if (isTerminalStatus(s.status)) return;
           const color = resigningColor === W || resigningColor === B ? resigningColor : s.mode === "net" ? s.playerColor : s.turn;
           s.turn = color;
           s.status = "resigned";
+          s.drawReason = null;
+          s.pendingPromotion = null;
           s.selected = null;
           s.legalMovesList = [];
           s.aiThinking = false;
@@ -653,7 +648,7 @@
         }, [syncHighlights, refresh]);
         const aiMove = useCallback(() => {
           const s = sr.current;
-          if (s.status === "checkmate" || s.status === "stalemate" || s.status === "resigned" || s.status === "timeout") return;
+          if (isTerminalStatus(s.status)) return;
           const moves = allLegalMoves(s.board, s.turn, s.ep);
           if (!moves.length) return;
           s.aiThinkToken += 1;
@@ -666,10 +661,11 @@
           s.aiThinking = true;
           setUi((v) => ({ ...v, aiThinking: true }));
           s.aiTimerId = setTimeout(async () => {
+            var _a;
             sr.current.aiTimerId = null;
             const stale = () => {
               const cur = sr.current;
-              return cur.aiThinkToken !== thinkToken || cur.status === "checkmate" || cur.status === "stalemate" || cur.status === "resigned" || cur.status === "timeout" || cur.turn === cur.playerColor;
+              return cur.aiThinkToken !== thinkToken || isTerminalStatus(cur.status) || cur.turn === cur.playerColor;
             };
             if (stale()) {
               sr.current.aiThinking = false;
@@ -712,9 +708,21 @@
             }
             sr.current.aiThinking = false;
             setUi((v) => ({ ...v, aiThinking: false }));
-            if (chosenMove) doMove(chosenMove.from, chosenMove.to);
+            if (chosenMove) doMove(chosenMove.from, chosenMove.to, { promotion: (_a = chosenMove.promotionType) != null ? _a : null });
           }, delay);
         }, [doMove, requestStockfishBestMove]);
+        const completePromotion = useCallback((nextType) => {
+          const s = sr.current;
+          const pending = s.pendingPromotion;
+          if (!pending) return;
+          const moved = doMove(pending.from, pending.to, {
+            relay: pending.relay,
+            promotion: normalizePromotionType(nextType)
+          });
+          if (moved && s.mode === "pvai" && !isTerminalStatus(s.status) && s.turn !== s.playerColor) {
+            aiMove();
+          }
+        }, [doMove, aiMove]);
         useEffect(() => {
           const timer = setInterval(() => {
             const s = sr.current;
@@ -729,7 +737,7 @@
         }, [tickClock, refresh]);
         handleClickRef.current = useCallback((e) => {
           const s = sr.current;
-          if (!s.mode || s.status === "checkmate" || s.status === "stalemate" || s.status === "resigned" || s.status === "timeout") return;
+          if (!s.mode || isTerminalStatus(s.status) || s.pendingPromotion) return;
           if (s.mode === "pvai" && s.turn !== s.playerColor) return;
           if (s.mode === "net" && s.turn !== s.playerColor) return;
           const rect = s.renderer.domElement.getBoundingClientRect();
@@ -749,8 +757,8 @@
             const [sr2, sc] = s.selected;
             const legal = s.legalMovesList.find(([mr, mc]) => mr === row && mc === col);
             if (legal) {
-              doMove([sr2, sc], legal);
-              if (s.mode === "pvai" && s.status !== "checkmate" && s.status !== "stalemate" && s.status !== "resigned" && s.status !== "timeout") {
+              const moved = doMove([sr2, sc], legal);
+              if (moved && s.mode === "pvai" && !isTerminalStatus(s.status) && s.turn !== s.playerColor) {
                 aiMove();
               }
             } else {
@@ -1319,7 +1327,7 @@
             setNet((v) => ({
               ...v,
               presenceState: "offline",
-              error: `Could not connect online lobby: ${e.message}`,
+              error: `Could not connect online lobby: ${formatSignalError(e, getSignalUrl())}`,
               statusMsg: ""
             }));
             return false;
@@ -1396,7 +1404,7 @@
             await client.connect();
             return true;
           } catch (e) {
-            setNet((v) => ({ ...v, screen: "lobby", error: `Could not reach signaling server: ${e.message}`, statusMsg: "" }));
+            setNet((v) => ({ ...v, screen: "lobby", error: `Could not reach signaling server: ${formatSignalError(e, signalUrl)}`, statusMsg: "" }));
             disconnectNet();
             return false;
           }
@@ -1439,7 +1447,7 @@
             await client.connect();
             return true;
           } catch (e) {
-            setNet((v) => ({ ...v, screen: "lobby", error: `Could not reach signaling server: ${e.message}`, statusMsg: "" }));
+            setNet((v) => ({ ...v, screen: "lobby", error: `Could not reach signaling server: ${formatSignalError(e, signalUrl)}`, statusMsg: "" }));
             disconnectNet();
             return false;
           }
@@ -1529,6 +1537,7 @@
           s.mode = mode;
           s.playerColor = playerColor;
           s.status = "playing";
+          s.drawReason = null;
           s.timeControlId = timeControl.id;
           s.clockIncrementMs = timeControl.incrementMs;
           s.clockMs = timeControl.initialMs == null ? { [W]: null, [B]: null } : { [W]: timeControl.initialMs, [B]: timeControl.initialMs };
@@ -1542,6 +1551,9 @@
           s.openingWhite = opening.white;
           s.openingBlack = opening.black;
           s.lastOpponentMove = null;
+          s.pendingPromotion = null;
+          s.positionCounts = /* @__PURE__ */ new Map();
+          s.positionCounts.set(positionKey(s.board, s.turn, s.ep), 1);
           s.aiMode = nextAiMode;
           s.aiDepth = nextAiDepth;
           s.aiPreset = nextAiPreset;
@@ -1638,10 +1650,10 @@
           if (from && s.netPeerId && from !== s.netPeerId) return;
           if (data.type === "move") {
             if (s.mode !== "net" || s.turn === s.playerColor) return;
-            const { from: mvFrom, to } = data;
+            const { from: mvFrom, to, promotion } = data;
             if (!Array.isArray(mvFrom) || !Array.isArray(to)) return;
             if (mvFrom.length < 2 || to.length < 2) return;
-            doMove(mvFrom, to, { relay: false });
+            doMove(mvFrom, to, { relay: false, promotion });
             return;
           }
           if (data.type === "resign") {
@@ -1668,7 +1680,7 @@
           }
         }, []);
         useEffect(() => {
-          if (ui.mode === "net" && (ui.status === "checkmate" || ui.status === "stalemate" || ui.status === "resigned" || ui.status === "timeout")) {
+          if (ui.mode === "net" && isTerminalStatus(ui.status)) {
             setPresenceStatus("lobby");
           }
         }, [ui.mode, ui.status, setPresenceStatus]);
@@ -1676,6 +1688,7 @@
         const statusMsg = () => {
           if (ui.status === "checkmate") return `\u2620 Checkmate \u2014 ${ui.turn === W ? "Black" : "White"} wins!`;
           if (ui.status === "stalemate") return "\u{1F91D} Stalemate \u2014 Draw";
+          if (ui.status === "draw") return `\u{1F91D} Draw \u2014 ${drawReasonLabel(ui.drawReason)}`;
           if (ui.status === "resigned") return `\u{1F3F3} ${ui.turn === W ? "White" : "Black"} resigned \u2014 ${ui.turn === W ? "Black" : "White"} wins!`;
           if (ui.status === "timeout") return `\u23F0 ${ui.turn === W ? "White" : "Black"} flagged \u2014 ${ui.turn === W ? "Black" : "White"} wins!`;
           if (ui.status === "check") return `\u26A0 ${turnLabel} is in Check!`;
@@ -1687,7 +1700,7 @@
           }
           return "";
         };
-        const isOver = ui.status === "checkmate" || ui.status === "stalemate" || ui.status === "resigned" || ui.status === "timeout";
+        const isOver = isTerminalStatus(ui.status);
         const activeTimeControl = resolveTimeControl(ui.timeControlId);
         const hasClock = activeTimeControl.initialMs != null;
         const currentAiPreset = resolveAiPreset(ui.aiPreset);
@@ -1782,6 +1795,12 @@
           textTransform: "none",
           letterSpacing: "0.01em"
         };
+        const promotionOptions = [
+          { type: P.QUEEN, label: "Queen", white: "\u2655", black: "\u265B" },
+          { type: P.ROOK, label: "Rook", white: "\u2656", black: "\u265C" },
+          { type: P.BISHOP, label: "Bishop", white: "\u2657", black: "\u265D" },
+          { type: P.KNIGHT, label: "Knight", white: "\u2658", black: "\u265E" }
+        ];
         return /* @__PURE__ */ React.createElement("div", { style: {
           width: "100vw",
           height: "100vh",
@@ -1880,7 +1899,30 @@
           s.status = "idle";
           setNet((v) => ({ ...v, screen: null, peerStatus: "", incomingChallenge: null, outgoingChallenge: null }));
           setUi((v) => ({ ...v, mode: null, status: "idle" }));
-        }, "#2a2010"), ui.mode && ui.mode !== "net" && btn("\u21BA Restart", () => startGame(ui.mode, ui.playerColor, ui.timeControlId), "#1a2a1a"))), /* @__PURE__ */ React.createElement("div", { ref: mountRef, style: { flex: 1, width: "100%", position: "relative" } }), !net.nameReady && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: cardStyle }, /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 10px", color: "#d4a843", fontSize: "1.7em" } }, "Choose Your Name"), /* @__PURE__ */ React.createElement("p", { style: { color: "#6a5a3a", margin: "0 0 18px", fontSize: "0.86em" } }, "This name is shown in the online lobby and challenge list."), net.error && /* @__PURE__ */ React.createElement("div", { style: { color: "#ff8888", background: "rgba(80,0,0,0.4)", border: "1px solid #aa3333", borderRadius: "8px", padding: "8px 14px", marginBottom: "14px", fontSize: "0.85em" } }, net.error), /* @__PURE__ */ React.createElement(
+        }, "#2a2010"), ui.mode && ui.mode !== "net" && btn("\u21BA Restart", () => startGame(ui.mode, ui.playerColor, ui.timeControlId), "#1a2a1a"))), /* @__PURE__ */ React.createElement("div", { ref: mountRef, style: { flex: 1, width: "100%", position: "relative" } }), ui.mode && ui.promotion && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: { ...cardStyle, minWidth: "420px", maxWidth: "460px" } }, /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 10px", color: "#d4a843", fontSize: "1.55em" } }, "Choose Promotion"), /* @__PURE__ */ React.createElement("p", { style: { color: "#7d6e4f", margin: "0 0 16px", fontSize: "0.82em" } }, "Select the piece your pawn becomes."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(2, minmax(140px, 1fr))", gap: "10px" } }, promotionOptions.map((opt) => /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            key: opt.type,
+            onClick: () => completePromotion(opt.type),
+            style: {
+              padding: "12px 14px",
+              borderRadius: "10px",
+              border: "1px solid #6b4f10",
+              background: "rgba(18,27,42,0.9)",
+              color: "#f0d9b5",
+              cursor: "pointer",
+              fontFamily: "'Palatino Linotype', Palatino, serif",
+              fontWeight: "bold",
+              fontSize: "0.95em",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: "8px"
+            }
+          },
+          /* @__PURE__ */ React.createElement("span", { style: { fontSize: "1.3em" } }, ui.promotion.color === W ? opt.white : opt.black),
+          opt.label
+        ))))), !net.nameReady && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: cardStyle }, /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 10px", color: "#d4a843", fontSize: "1.7em" } }, "Choose Your Name"), /* @__PURE__ */ React.createElement("p", { style: { color: "#6a5a3a", margin: "0 0 18px", fontSize: "0.86em" } }, "This name is shown in the online lobby and challenge list."), net.error && /* @__PURE__ */ React.createElement("div", { style: { color: "#ff8888", background: "rgba(80,0,0,0.4)", border: "1px solid #aa3333", borderRadius: "8px", padding: "8px 14px", marginBottom: "14px", fontSize: "0.85em" } }, net.error), /* @__PURE__ */ React.createElement(
           "input",
           {
             style: nameInputStyle,
