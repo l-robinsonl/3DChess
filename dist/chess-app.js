@@ -9,6 +9,43 @@
       const PRESENCE_APP = "chess3d";
       const PRESENCE_ROOM = "lobby";
       const NAME_STORAGE_KEY = "chess3d_player_name";
+      const STOCKFISH_WORKER_PATH = "./stockfish-18-lite-single.js";
+      const DEFAULT_STOCKFISH_DEPTH = 10;
+      const STOCKFISH_DEPTH_MIN = 1;
+      const STOCKFISH_DEPTH_MAX = 20;
+      const AI_MODE_RANDOM = "random";
+      const AI_MODE_STOCKFISH = "stockfish";
+      const AI_PRESETS = [
+        { id: "custom", label: "Custom Engine", limitStrength: false, skill: 20, elo: null, note: "No strength cap." },
+        { id: "beginner", label: "Beginner Bot (~900)", limitStrength: true, skill: 2, elo: 900, note: "Good for learning." },
+        { id: "club", label: "Club Bot (~1500)", limitStrength: true, skill: 8, elo: 1500, note: "Solid club level." },
+        { id: "master", label: "Master Bot (~2200)", limitStrength: true, skill: 16, elo: 2200, note: "Strong tactical play." },
+        { id: "magnus", label: "Magnus Bot (Approx)", limitStrength: false, skill: 20, elo: null, note: "Very strong Stockfish preset (not real Magnus)." }
+      ];
+      const AI_PRESET_MAP = Object.fromEntries(AI_PRESETS.map((preset) => [preset.id, preset]));
+      const AI_LEVELS = [
+        { id: "pathetic", label: "Pathetic (Random)", mode: AI_MODE_RANDOM, preset: "custom", depth: 1, note: "Pure random legal moves." },
+        { id: "novice", label: "Novice", mode: AI_MODE_STOCKFISH, preset: "beginner", depth: 4, note: "Makes obvious mistakes." },
+        { id: "easy", label: "Easy", mode: AI_MODE_STOCKFISH, preset: "beginner", depth: 6, note: "Beginner-friendly Stockfish." },
+        { id: "medium", label: "Medium", mode: AI_MODE_STOCKFISH, preset: "club", depth: 9, note: "Club-level challenge." },
+        { id: "hard", label: "Hard", mode: AI_MODE_STOCKFISH, preset: "master", depth: 12, note: "Very sharp tactically." },
+        { id: "brutal", label: "Brutal", mode: AI_MODE_STOCKFISH, preset: "custom", depth: 16, note: "Strong unrestricted engine." },
+        { id: "magnus", label: "Magnus (Approx)", mode: AI_MODE_STOCKFISH, preset: "magnus", depth: 20, note: "Maximum strength preset, not real Magnus." }
+      ];
+      const AI_LEVEL_MAP = Object.fromEntries(AI_LEVELS.map((level) => [level.id, level]));
+      function clampStockfishDepth(depth) {
+        const parsed = Number(depth);
+        if (!Number.isFinite(parsed)) return DEFAULT_STOCKFISH_DEPTH;
+        return Math.max(STOCKFISH_DEPTH_MIN, Math.min(STOCKFISH_DEPTH_MAX, Math.floor(parsed)));
+      }
+      function resolveAiPreset(id) {
+        var _a;
+        return (_a = AI_PRESET_MAP[id]) != null ? _a : AI_PRESET_MAP.custom;
+      }
+      function resolveAiLevel(id) {
+        var _a;
+        return (_a = AI_LEVEL_MAP[id]) != null ? _a : AI_LEVEL_MAP.pathetic;
+      }
       function normalizePresenceStatus(status) {
         return status === "playing" ? "playing" : "lobby";
       }
@@ -33,6 +70,17 @@
           clockIncrementMs: 0,
           clockMs: { [W]: null, [B]: null },
           clockLastTickAt: 0,
+          moveHistory: [],
+          halfmoveClock: 0,
+          fullmoveNumber: 1,
+          openingWhite: "Start Position",
+          openingBlack: "Awaiting White move",
+          aiMode: AI_MODE_RANDOM,
+          aiDepth: DEFAULT_STOCKFISH_DEPTH,
+          aiPreset: "custom",
+          aiLevelId: "pathetic",
+          aiThinkToken: 0,
+          aiTimerId: null,
           pieceMeshes: /* @__PURE__ */ new Map(),
           labelSprites: /* @__PURE__ */ new Map(),
           highlights: [],
@@ -70,7 +118,13 @@
           playerColor: W,
           aiThinking: false,
           timeControlId: "blitz",
-          clockMs: { [W]: null, [B]: null }
+          clockMs: { [W]: null, [B]: null },
+          aiMode: AI_MODE_RANDOM,
+          aiDepth: DEFAULT_STOCKFISH_DEPTH,
+          aiPreset: "custom",
+          aiLevelId: "pathetic",
+          openingWhite: "Start Position",
+          openingBlack: "Awaiting White move"
         });
         const [net, setNet] = useState({
           screen: null,
@@ -93,7 +147,18 @@
           presenceState: "offline",
           // offline | connecting | online
           incomingChallenge: null,
-          outgoingChallenge: null
+          outgoingChallenge: null,
+          aiMode: AI_MODE_RANDOM,
+          stockfishDepth: DEFAULT_STOCKFISH_DEPTH,
+          stockfishPreset: "custom",
+          aiLevelId: "pathetic"
+        });
+        const stockfishRef = useRef({
+          worker: null,
+          ready: false,
+          readyResolvers: [],
+          readyRejectors: [],
+          pendingSearch: null
         });
         const refresh = useCallback(() => {
           const s = sr.current;
@@ -104,9 +169,185 @@
             playerColor: s.playerColor,
             aiThinking: s.aiThinking || false,
             timeControlId: s.timeControlId,
-            clockMs: { ...s.clockMs }
+            clockMs: { ...s.clockMs },
+            aiMode: s.aiMode,
+            aiDepth: s.aiDepth,
+            aiPreset: s.aiPreset,
+            aiLevelId: s.aiLevelId,
+            openingWhite: s.openingWhite,
+            openingBlack: s.openingBlack
           });
         }, []);
+        const terminateStockfish = useCallback(() => {
+          var _a;
+          const state = stockfishRef.current;
+          if ((_a = state.pendingSearch) == null ? void 0 : _a.reject) {
+            state.pendingSearch.reject(new Error("search-cancelled"));
+            state.pendingSearch = null;
+          }
+          if (state.readyRejectors.length) {
+            for (const rejectReady of state.readyRejectors) {
+              rejectReady(new Error("engine-terminated"));
+            }
+          }
+          state.ready = false;
+          state.readyResolvers = [];
+          state.readyRejectors = [];
+          if (state.worker) {
+            try {
+              state.worker.terminate();
+            } catch (e) {
+            }
+            state.worker = null;
+          }
+        }, []);
+        const ensureStockfishReady = useCallback(async () => {
+          const state = stockfishRef.current;
+          if (!state.worker) {
+            const worker = new Worker(STOCKFISH_WORKER_PATH);
+            state.worker = worker;
+            state.ready = false;
+            worker.addEventListener("message", (event) => {
+              var _a, _b;
+              const line = String((_a = event.data) != null ? _a : "").trim();
+              if (!line) return;
+              if (line === "uciok") {
+                try {
+                  worker.postMessage("isready");
+                } catch (e) {
+                }
+                return;
+              }
+              if (line === "readyok") {
+                state.ready = true;
+                const waiters = [...state.readyResolvers];
+                state.readyResolvers = [];
+                state.readyRejectors = [];
+                for (const resolveReady of waiters) resolveReady(worker);
+                return;
+              }
+              if (line.startsWith("bestmove ")) {
+                if (!state.pendingSearch) return;
+                const move = (_b = line.split(/\s+/)[1]) != null ? _b : "";
+                const pending = state.pendingSearch;
+                state.pendingSearch = null;
+                pending.resolve(move);
+              }
+            });
+            worker.addEventListener("error", () => {
+              var _a;
+              const err = new Error("stockfish-worker-error");
+              if ((_a = state.pendingSearch) == null ? void 0 : _a.reject) {
+                state.pendingSearch.reject(err);
+                state.pendingSearch = null;
+              }
+              if (state.readyRejectors.length) {
+                for (const rejectReady of state.readyRejectors) rejectReady(err);
+              }
+              state.ready = false;
+              state.readyResolvers = [];
+              state.readyRejectors = [];
+              try {
+                worker.terminate();
+              } catch (e) {
+              }
+              if (state.worker === worker) state.worker = null;
+            });
+            try {
+              worker.postMessage("uci");
+            } catch (e) {
+              terminateStockfish();
+              throw new Error("stockfish-init-failed");
+            }
+          }
+          if (state.ready && state.worker) return state.worker;
+          return await new Promise((resolve, reject) => {
+            const currentWorker = state.worker;
+            if (!currentWorker) {
+              reject(new Error("stockfish-missing-worker"));
+              return;
+            }
+            const timeout = setTimeout(() => {
+              state.readyResolvers = state.readyResolvers.filter((fn) => fn !== onReady);
+              state.readyRejectors = state.readyRejectors.filter((fn) => fn !== onFail);
+              reject(new Error("stockfish-ready-timeout"));
+            }, 12e3);
+            const onReady = (worker) => {
+              clearTimeout(timeout);
+              resolve(worker);
+            };
+            const onFail = (err) => {
+              clearTimeout(timeout);
+              reject(err instanceof Error ? err : new Error(String(err)));
+            };
+            state.readyResolvers.push(onReady);
+            state.readyRejectors.push(onFail);
+            try {
+              currentWorker.postMessage("isready");
+            } catch (e) {
+              clearTimeout(timeout);
+              state.readyResolvers = state.readyResolvers.filter((fn) => fn !== onReady);
+              state.readyRejectors = state.readyRejectors.filter((fn) => fn !== onFail);
+              reject(new Error("stockfish-ready-post-failed"));
+            }
+          });
+        }, [terminateStockfish]);
+        const applyStockfishPreset = useCallback((worker, presetId) => {
+          const preset = resolveAiPreset(presetId);
+          worker.postMessage("setoption name Ponder value false");
+          worker.postMessage("setoption name Threads value 1");
+          worker.postMessage("setoption name Skill Level value " + preset.skill);
+          if (preset.limitStrength && Number.isFinite(preset.elo)) {
+            worker.postMessage("setoption name UCI_LimitStrength value true");
+            worker.postMessage("setoption name UCI_Elo value " + preset.elo);
+          } else {
+            worker.postMessage("setoption name UCI_LimitStrength value false");
+          }
+        }, []);
+        const requestStockfishBestMove = useCallback(async (fen, depth, presetId) => {
+          const worker = await ensureStockfishReady();
+          const state = stockfishRef.current;
+          if (state.pendingSearch) {
+            try {
+              worker.postMessage("stop");
+            } catch (e) {
+            }
+            state.pendingSearch.reject(new Error("search-superseded"));
+            state.pendingSearch = null;
+          }
+          const safeDepth = clampStockfishDepth(depth);
+          applyStockfishPreset(worker, presetId);
+          return await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              var _a;
+              if (((_a = state.pendingSearch) == null ? void 0 : _a.reject) === rejectSearch) {
+                state.pendingSearch = null;
+              }
+              try {
+                worker.postMessage("stop");
+              } catch (e) {
+              }
+              reject(new Error("stockfish-search-timeout"));
+            }, 15e3);
+            const resolveSearch = (bestMove) => {
+              clearTimeout(timeout);
+              resolve(bestMove);
+            };
+            const rejectSearch = (err) => {
+              clearTimeout(timeout);
+              reject(err instanceof Error ? err : new Error(String(err)));
+            };
+            state.pendingSearch = { resolve: resolveSearch, reject: rejectSearch };
+            try {
+              worker.postMessage("position fen " + fen);
+              worker.postMessage("go depth " + safeDepth);
+            } catch (e) {
+              clearTimeout(timeout);
+              state.pendingSearch = null;
+              reject(e instanceof Error ? e : new Error(String(e)));
+            }
+          });
+        }, [ensureStockfishReady, applyStockfishPreset]);
         const syncBoard = useCallback(() => {
           const s = sr.current;
           if (!s.scene) return;
@@ -252,6 +493,11 @@
           s.selected = null;
           s.legalMovesList = [];
           s.aiThinking = false;
+          if (s.aiTimerId) {
+            clearTimeout(s.aiTimerId);
+            s.aiTimerId = null;
+          }
+          s.aiThinkToken += 1;
           s.clockLastTickAt = 0;
           if (typeof s.clockMs[color] === "number") {
             s.clockMs[color] = 0;
@@ -314,12 +560,20 @@
           const isCapture = !!(captured || isEP);
           const isCastle = legal[2] === "castleK" || legal[2] === "castleQ";
           const newBoard = applyMove(s.board, [fr, fc], legal, s.ep);
+          const uciMove = moveToUci([fr, fc], legal, piece);
           if (captured) s.captured[piece.color].push({ type: captured.type, color: captured.color });
           if (epPiece) s.captured[piece.color].push({ type: epPiece.type, color: epPiece.color });
           let newEp = null;
           if (piece.type === P.PAWN && Math.abs(legal[0] - fr) === 2) {
             newEp = [(fr + legal[0]) / 2, legal[1]];
           }
+          if (piece.type === P.PAWN || isCapture) s.halfmoveClock = 0;
+          else s.halfmoveClock += 1;
+          if (piece.color === B) s.fullmoveNumber += 1;
+          if (uciMove) s.moveHistory = [...s.moveHistory, uciMove];
+          const opening = describeOpening(s.moveHistory);
+          s.openingWhite = opening.white;
+          s.openingBlack = opening.black;
           s.board = newBoard;
           s.ep = newEp;
           s.turn = s.turn === W ? B : W;
@@ -358,6 +612,11 @@
           s.selected = null;
           s.legalMovesList = [];
           s.aiThinking = false;
+          if (s.aiTimerId) {
+            clearTimeout(s.aiTimerId);
+            s.aiTimerId = null;
+          }
+          s.aiThinkToken += 1;
           s.clockLastTickAt = 0;
           if (relay && s.mode === "net" && s.netClient && s.netPeerId) {
             s.netClient.sendTo(s.netPeerId, { type: "resign", color });
@@ -370,21 +629,65 @@
           if (s.status === "checkmate" || s.status === "stalemate" || s.status === "resigned" || s.status === "timeout") return;
           const moves = allLegalMoves(s.board, s.turn, s.ep);
           if (!moves.length) return;
-          const delay = 800 + Math.random() * 900 + Math.random() * 500;
+          s.aiThinkToken += 1;
+          const thinkToken = s.aiThinkToken;
+          if (s.aiTimerId) {
+            clearTimeout(s.aiTimerId);
+            s.aiTimerId = null;
+          }
+          const delay = s.aiMode === AI_MODE_STOCKFISH ? 220 + Math.random() * 220 : 800 + Math.random() * 900 + Math.random() * 500;
           s.aiThinking = true;
           setUi((v) => ({ ...v, aiThinking: true }));
-          setTimeout(() => {
-            if (sr.current.status === "checkmate" || sr.current.status === "stalemate" || sr.current.status === "resigned" || sr.current.status === "timeout" || sr.current.turn === sr.current.playerColor) {
+          s.aiTimerId = setTimeout(async () => {
+            sr.current.aiTimerId = null;
+            const stale = () => {
+              const cur = sr.current;
+              return cur.aiThinkToken !== thinkToken || cur.status === "checkmate" || cur.status === "stalemate" || cur.status === "resigned" || cur.status === "timeout" || cur.turn === cur.playerColor;
+            };
+            if (stale()) {
               sr.current.aiThinking = false;
               setUi((v) => ({ ...v, aiThinking: false }));
               return;
             }
-            const mv = moves[Math.floor(Math.random() * moves.length)];
+            let chosenMove = null;
+            if (sr.current.aiMode === AI_MODE_STOCKFISH) {
+              try {
+                const fen = boardToFen(
+                  sr.current.board,
+                  sr.current.turn,
+                  sr.current.ep,
+                  sr.current.halfmoveClock,
+                  sr.current.fullmoveNumber
+                );
+                const bestMove = await requestStockfishBestMove(
+                  fen,
+                  sr.current.aiDepth,
+                  sr.current.aiPreset
+                );
+                if (bestMove && bestMove !== "(none)") {
+                  chosenMove = uciToMove(bestMove, sr.current.board, sr.current.ep);
+                }
+              } catch (err) {
+                console.warn("Stockfish search failed, using random fallback", err);
+              }
+            }
+            if (stale()) {
+              sr.current.aiThinking = false;
+              setUi((v) => ({ ...v, aiThinking: false }));
+              return;
+            }
+            if (!chosenMove) {
+              const fallback = allLegalMoves(sr.current.board, sr.current.turn, sr.current.ep);
+              if (fallback.length) {
+                const mv = fallback[Math.floor(Math.random() * fallback.length)];
+                chosenMove = { from: mv.from, to: mv.to };
+              }
+            }
             sr.current.aiThinking = false;
             setUi((v) => ({ ...v, aiThinking: false }));
-            doMove(mv.from, mv.to);
+            if (chosenMove) doMove(chosenMove.from, chosenMove.to);
           }, delay);
-        }, [doMove]);
+        }, [doMove, requestStockfishBestMove]);
         useEffect(() => {
           const timer = setInterval(() => {
             const s = sr.current;
@@ -815,8 +1118,13 @@
               (_b = sr.current.presenceClient) == null ? void 0 : _b.close();
             } catch (e) {
             }
+            if (sr.current.aiTimerId) {
+              clearTimeout(sr.current.aiTimerId);
+              sr.current.aiTimerId = null;
+            }
+            terminateStockfish();
           };
-        }, []);
+        }, [terminateStockfish]);
         const startGameRef = useRef(null);
         const presenceMsgRef = useRef(null);
         const buildOnlinePlayers = useCallback(() => {
@@ -1172,10 +1480,20 @@
           });
           setNet((v) => ({ ...v, incomingChallenge: null }));
         }, [net.incomingChallenge, net.playerName]);
-        const startGame = useCallback((mode, playerColor = W, timeControlId = "casual") => {
+        const startGame = useCallback((mode, playerColor = W, timeControlId = "casual", aiConfig = null) => {
+          var _a, _b, _c, _d, _e, _f, _g, _h;
           const s = sr.current;
           const timeControl = resolveTimeControl(timeControlId);
           if (mode !== "net") disconnectNet();
+          const nextAiMode = (_b = (_a = aiConfig == null ? void 0 : aiConfig.mode) != null ? _a : s.aiMode) != null ? _b : AI_MODE_RANDOM;
+          const nextAiPreset = (_d = (_c = aiConfig == null ? void 0 : aiConfig.preset) != null ? _c : s.aiPreset) != null ? _d : "custom";
+          const nextAiDepth = clampStockfishDepth((_f = (_e = aiConfig == null ? void 0 : aiConfig.depth) != null ? _e : s.aiDepth) != null ? _f : DEFAULT_STOCKFISH_DEPTH);
+          const nextAiLevelId = (_h = (_g = aiConfig == null ? void 0 : aiConfig.levelId) != null ? _g : s.aiLevelId) != null ? _h : "pathetic";
+          if (s.aiTimerId) {
+            clearTimeout(s.aiTimerId);
+            s.aiTimerId = null;
+          }
+          s.aiThinkToken += 1;
           s.board = mkBoard();
           s.turn = W;
           s.selected = null;
@@ -1190,6 +1508,19 @@
           s.clockLastTickAt = timeControl.initialMs == null ? 0 : performance.now();
           s.aiThinking = false;
           s.captured = { [W]: [], [B]: [] };
+          s.moveHistory = [];
+          s.halfmoveClock = 0;
+          s.fullmoveNumber = 1;
+          const opening = describeOpening([]);
+          s.openingWhite = opening.white;
+          s.openingBlack = opening.black;
+          s.aiMode = nextAiMode;
+          s.aiDepth = nextAiDepth;
+          s.aiPreset = nextAiPreset;
+          s.aiLevelId = nextAiLevelId;
+          if (mode !== "pvai" || nextAiMode === AI_MODE_RANDOM) {
+            terminateStockfish();
+          }
           s.spherical.theta = playerColor === W ? 0 : Math.PI;
           s.spherical.phi = 0.85;
           s.spherical.radius = 14;
@@ -1199,12 +1530,19 @@
           syncGraveyard();
           refresh();
           setPresenceStatus(mode === "net" ? "playing" : "lobby");
+          if (mode === "pvai" && nextAiMode === AI_MODE_STOCKFISH) {
+            ensureStockfishReady().then((worker) => {
+              worker.postMessage("ucinewgame");
+              worker.postMessage("isready");
+            }).catch(() => {
+            });
+          }
           if (mode === "pvai" && playerColor === B) {
             setTimeout(() => {
               if (sr.current.turn !== sr.current.playerColor) aiMove();
             }, 600);
           }
-        }, [syncBoard, syncHighlights, syncGraveyard, refresh, aiMove, disconnectNet, setPresenceStatus]);
+        }, [syncBoard, syncHighlights, syncGraveyard, refresh, aiMove, disconnectNet, setPresenceStatus, ensureStockfishReady, terminateStockfish]);
         startGameRef.current = startGame;
         presenceMsgRef.current = async ({ from, payload }) => {
           var _a, _b, _c, _d;
@@ -1324,6 +1662,9 @@
         const isOver = ui.status === "checkmate" || ui.status === "stalemate" || ui.status === "resigned" || ui.status === "timeout";
         const activeTimeControl = resolveTimeControl(ui.timeControlId);
         const hasClock = activeTimeControl.initialMs != null;
+        const currentAiPreset = resolveAiPreset(ui.aiPreset);
+        const currentAiLevel = resolveAiLevel(ui.aiLevelId);
+        const aiSummary = ui.aiMode === AI_MODE_RANDOM ? "Pathetic (random moves)" : currentAiLevel.label + " \xB7 " + currentAiPreset.label + " \xB7 depth " + ui.aiDepth;
         const btn = (label, onClick, color = "#8b6914", extra = {}) => /* @__PURE__ */ React.createElement(
           "button",
           {
@@ -1454,7 +1795,25 @@
           color: "#c8a040",
           fontSize: "0.84em",
           fontStyle: "italic"
-        } }, /* @__PURE__ */ React.createElement("span", { style: { animation: "pulse 1s ease-in-out infinite" } }, "\u25CF"), "AI is thinking\u2026"), ui.mode === "net" && /* @__PURE__ */ React.createElement("div", { style: {
+        } }, /* @__PURE__ */ React.createElement("span", { style: { animation: "pulse 1s ease-in-out infinite" } }, "\u25CF"), "AI is thinking\u2026"), ui.mode === "pvai" && /* @__PURE__ */ React.createElement("div", { style: {
+          padding: "5px 12px",
+          borderRadius: "20px",
+          fontSize: "0.8em",
+          background: "rgba(30,50,90,0.35)",
+          border: "1px solid #355a95",
+          color: "#9bc2ff"
+        } }, "AI: ", aiSummary), ui.mode && /* @__PURE__ */ React.createElement("div", { style: {
+          display: "flex",
+          alignItems: "center",
+          gap: "10px",
+          flexWrap: "wrap",
+          padding: "5px 12px",
+          borderRadius: "10px",
+          background: "rgba(255,255,255,0.04)",
+          border: "1px solid #3a2f1a",
+          color: "#c9b38b",
+          fontSize: "0.76em"
+        } }, /* @__PURE__ */ React.createElement("span", null, "White opening: ", ui.openingWhite), /* @__PURE__ */ React.createElement("span", null, "Black defense: ", ui.openingBlack)), ui.mode === "net" && /* @__PURE__ */ React.createElement("div", { style: {
           display: "flex",
           alignItems: "center",
           gap: "8px",
@@ -1513,7 +1872,33 @@
             onChange: (e) => setNet((v) => ({ ...v, timeControlId: e.target.value }))
           },
           TIME_CONTROLS.map((tc) => /* @__PURE__ */ React.createElement("option", { key: tc.id, value: tc.id }, tc.label))
-        )), btn("\u265F\u265F  Player vs Player", () => startGame("pvp", W, net.timeControlId), "#5c3d1e"), btn("\u26AA  Play as White vs AI", () => startGame("pvai", W, net.timeControlId), "#1a3a1a"), btn("\u26AB  Play as Black vs AI", () => startGame("pvai", B, net.timeControlId), "#1a1a3a"), /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid #2a1f0a", margin: "4px 0" } }), btn("\u{1F310}  Play Online", () => openOnlineLobby(), "#1a2040")), /* @__PURE__ */ React.createElement("p", { style: { color: "#3a3020", margin: "22px 0 0", fontSize: "0.75em" } }, "AI plays random legal moves \u2014 improve it yourself!"))), net.screen === "lobby" && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: { ...cardStyle, minWidth: "560px", maxWidth: "760px", width: "92vw" } }, /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 6px", color: "#d4a843", fontSize: "1.6em" } }, "\u{1F310} Online Lobby"), /* @__PURE__ */ React.createElement("p", { style: { color: "#6a5a3a", margin: "0 0 18px", fontSize: "0.82em" } }, "Signed in as ", /* @__PURE__ */ React.createElement("strong", null, net.playerName || "Player"), " \xB7 ", net.presenceState === "online" ? "connected" : net.presenceState), net.error && /* @__PURE__ */ React.createElement("div", { style: { color: "#ff8888", background: "rgba(80,0,0,0.4)", border: "1px solid #aa3333", borderRadius: "8px", padding: "8px 14px", marginBottom: "14px", fontSize: "0.85em" } }, net.error), net.incomingChallenge && /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid #6b4f10", borderRadius: "10px", padding: "12px", marginBottom: "14px", background: "rgba(60,40,10,0.35)" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#f0d9b5", marginBottom: "8px", fontSize: "0.94em" } }, "Challenge from ", /* @__PURE__ */ React.createElement("strong", null, net.incomingChallenge.fromName), " (", resolveTimeControl(net.incomingChallenge.timeControlId).label, ")"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: "10px", justifyContent: "center" } }, btn("Accept", () => acceptChallenge(), "#1a3a2a", { fontSize: "0.84em", padding: "8px 14px" }), btn("Decline", () => declineChallenge(), "#5a1f1f", { fontSize: "0.84em", padding: "8px 14px" }))), net.outgoingChallenge && /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid #2a5f9f", borderRadius: "10px", padding: "10px", marginBottom: "14px", background: "rgba(25,45,75,0.35)", color: "#9bc2ff", fontSize: "0.84em" } }, "Waiting for ", /* @__PURE__ */ React.createElement("strong", null, net.outgoingChallenge.toName), " to accept your challenge..."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: "6px", textAlign: "left", marginBottom: "10px" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" } }, "TIME CONTROL (for your outgoing challenge)"), /* @__PURE__ */ React.createElement(
+        )), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: "6px", textAlign: "left" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" } }, "AI DIFFICULTY"), /* @__PURE__ */ React.createElement(
+          "select",
+          {
+            style: timeSelectStyle,
+            value: net.aiLevelId,
+            onChange: (e) => {
+              const level = resolveAiLevel(e.target.value);
+              setNet((v) => ({
+                ...v,
+                aiLevelId: level.id,
+                aiMode: level.mode,
+                stockfishPreset: level.preset,
+                stockfishDepth: clampStockfishDepth(level.depth)
+              }));
+            }
+          },
+          AI_LEVELS.map((level) => /* @__PURE__ */ React.createElement("option", { key: level.id, value: level.id }, level.label))
+        ), /* @__PURE__ */ React.createElement("div", { style: { color: "#6a5a3a", fontSize: "0.72em" } }, resolveAiLevel(net.aiLevelId).note)), net.aiMode === AI_MODE_STOCKFISH && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: "6px", textAlign: "left" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" } }, "STOCKFISH DEPTH (", net.stockfishDepth, ")"), /* @__PURE__ */ React.createElement(
+          "input",
+          {
+            type: "range",
+            min: STOCKFISH_DEPTH_MIN,
+            max: STOCKFISH_DEPTH_MAX,
+            value: net.stockfishDepth,
+            onChange: (e) => setNet((v) => ({ ...v, aiMode: AI_MODE_STOCKFISH, stockfishDepth: clampStockfishDepth(e.target.value) }))
+          }
+        )), btn("\u265F\u265F  Player vs Player", () => startGame("pvp", W, net.timeControlId), "#5c3d1e"), btn("\u26AA  Play as White vs AI", () => startGame("pvai", W, net.timeControlId, { mode: net.aiMode, depth: net.stockfishDepth, preset: net.stockfishPreset, levelId: net.aiLevelId }), "#1a3a1a"), btn("\u26AB  Play as Black vs AI", () => startGame("pvai", B, net.timeControlId, { mode: net.aiMode, depth: net.stockfishDepth, preset: net.stockfishPreset, levelId: net.aiLevelId }), "#1a1a3a"), /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid #2a1f0a", margin: "4px 0" } }), btn("\u{1F310}  Play Online", () => openOnlineLobby(), "#1a2040")), /* @__PURE__ */ React.createElement("p", { style: { color: "#3a3020", margin: "22px 0 0", fontSize: "0.75em" } }, "Pathetic = random. Higher levels use Stockfish presets + adjustable depth."))), net.screen === "lobby" && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: { ...cardStyle, minWidth: "560px", maxWidth: "760px", width: "92vw" } }, /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 6px", color: "#d4a843", fontSize: "1.6em" } }, "\u{1F310} Online Lobby"), /* @__PURE__ */ React.createElement("p", { style: { color: "#6a5a3a", margin: "0 0 18px", fontSize: "0.82em" } }, "Signed in as ", /* @__PURE__ */ React.createElement("strong", null, net.playerName || "Player"), " \xB7 ", net.presenceState === "online" ? "connected" : net.presenceState), net.error && /* @__PURE__ */ React.createElement("div", { style: { color: "#ff8888", background: "rgba(80,0,0,0.4)", border: "1px solid #aa3333", borderRadius: "8px", padding: "8px 14px", marginBottom: "14px", fontSize: "0.85em" } }, net.error), net.incomingChallenge && /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid #6b4f10", borderRadius: "10px", padding: "12px", marginBottom: "14px", background: "rgba(60,40,10,0.35)" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#f0d9b5", marginBottom: "8px", fontSize: "0.94em" } }, "Challenge from ", /* @__PURE__ */ React.createElement("strong", null, net.incomingChallenge.fromName), " (", resolveTimeControl(net.incomingChallenge.timeControlId).label, ")"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: "10px", justifyContent: "center" } }, btn("Accept", () => acceptChallenge(), "#1a3a2a", { fontSize: "0.84em", padding: "8px 14px" }), btn("Decline", () => declineChallenge(), "#5a1f1f", { fontSize: "0.84em", padding: "8px 14px" }))), net.outgoingChallenge && /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid #2a5f9f", borderRadius: "10px", padding: "10px", marginBottom: "14px", background: "rgba(25,45,75,0.35)", color: "#9bc2ff", fontSize: "0.84em" } }, "Waiting for ", /* @__PURE__ */ React.createElement("strong", null, net.outgoingChallenge.toName), " to accept your challenge..."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: "6px", textAlign: "left", marginBottom: "10px" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" } }, "TIME CONTROL (for your outgoing challenge)"), /* @__PURE__ */ React.createElement(
           "select",
           {
             style: timeSelectStyle,

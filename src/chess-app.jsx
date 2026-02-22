@@ -3,6 +3,48 @@ const { useState, useEffect, useRef, useCallback } = React;
 const PRESENCE_APP = "chess3d";
 const PRESENCE_ROOM = "lobby";
 const NAME_STORAGE_KEY = "chess3d_player_name";
+const STOCKFISH_WORKER_PATH = "./stockfish-18-lite-single.js";
+const DEFAULT_STOCKFISH_DEPTH = 10;
+const STOCKFISH_DEPTH_MIN = 1;
+const STOCKFISH_DEPTH_MAX = 20;
+const AI_MODE_RANDOM = "random";
+const AI_MODE_STOCKFISH = "stockfish";
+
+const AI_PRESETS = [
+  { id: "custom", label: "Custom Engine", limitStrength: false, skill: 20, elo: null, note: "No strength cap." },
+  { id: "beginner", label: "Beginner Bot (~900)", limitStrength: true, skill: 2, elo: 900, note: "Good for learning." },
+  { id: "club", label: "Club Bot (~1500)", limitStrength: true, skill: 8, elo: 1500, note: "Solid club level." },
+  { id: "master", label: "Master Bot (~2200)", limitStrength: true, skill: 16, elo: 2200, note: "Strong tactical play." },
+  { id: "magnus", label: "Magnus Bot (Approx)", limitStrength: false, skill: 20, elo: null, note: "Very strong Stockfish preset (not real Magnus)." },
+];
+
+const AI_PRESET_MAP = Object.fromEntries(AI_PRESETS.map((preset) => [preset.id, preset]));
+
+const AI_LEVELS = [
+  { id: "pathetic", label: "Pathetic (Random)", mode: AI_MODE_RANDOM, preset: "custom", depth: 1, note: "Pure random legal moves." },
+  { id: "novice", label: "Novice", mode: AI_MODE_STOCKFISH, preset: "beginner", depth: 4, note: "Makes obvious mistakes." },
+  { id: "easy", label: "Easy", mode: AI_MODE_STOCKFISH, preset: "beginner", depth: 6, note: "Beginner-friendly Stockfish." },
+  { id: "medium", label: "Medium", mode: AI_MODE_STOCKFISH, preset: "club", depth: 9, note: "Club-level challenge." },
+  { id: "hard", label: "Hard", mode: AI_MODE_STOCKFISH, preset: "master", depth: 12, note: "Very sharp tactically." },
+  { id: "brutal", label: "Brutal", mode: AI_MODE_STOCKFISH, preset: "custom", depth: 16, note: "Strong unrestricted engine." },
+  { id: "magnus", label: "Magnus (Approx)", mode: AI_MODE_STOCKFISH, preset: "magnus", depth: 20, note: "Maximum strength preset, not real Magnus." },
+];
+
+const AI_LEVEL_MAP = Object.fromEntries(AI_LEVELS.map((level) => [level.id, level]));
+
+function clampStockfishDepth(depth) {
+  const parsed = Number(depth);
+  if (!Number.isFinite(parsed)) return DEFAULT_STOCKFISH_DEPTH;
+  return Math.max(STOCKFISH_DEPTH_MIN, Math.min(STOCKFISH_DEPTH_MAX, Math.floor(parsed)));
+}
+
+function resolveAiPreset(id) {
+  return AI_PRESET_MAP[id] ?? AI_PRESET_MAP.custom;
+}
+
+function resolveAiLevel(id) {
+  return AI_LEVEL_MAP[id] ?? AI_LEVEL_MAP.pathetic;
+}
 
 function normalizePresenceStatus(status) {
   return status === "playing" ? "playing" : "lobby";
@@ -28,6 +70,17 @@ function Chess3D() {
     clockIncrementMs: 0,
     clockMs: { [W]: null, [B]: null },
     clockLastTickAt: 0,
+    moveHistory: [],
+    halfmoveClock: 0,
+    fullmoveNumber: 1,
+    openingWhite: "Start Position",
+    openingBlack: "Awaiting White move",
+    aiMode: AI_MODE_RANDOM,
+    aiDepth: DEFAULT_STOCKFISH_DEPTH,
+    aiPreset: "custom",
+    aiLevelId: "pathetic",
+    aiThinkToken: 0,
+    aiTimerId: null,
     pieceMeshes: new Map(),
     labelSprites: new Map(),
     highlights: [],
@@ -61,6 +114,12 @@ function Chess3D() {
     aiThinking: false,
     timeControlId: "blitz",
     clockMs: { [W]: null, [B]: null },
+    aiMode: AI_MODE_RANDOM,
+    aiDepth: DEFAULT_STOCKFISH_DEPTH,
+    aiPreset: "custom",
+    aiLevelId: "pathetic",
+    openingWhite: "Start Position",
+    openingBlack: "Awaiting White move",
   });
   const [net, setNet] = useState({
     screen: null,      // null | "lobby" | "waiting" | "joining"
@@ -78,6 +137,18 @@ function Chess3D() {
     presenceState: "offline", // offline | connecting | online
     incomingChallenge: null,
     outgoingChallenge: null,
+    aiMode: AI_MODE_RANDOM,
+    stockfishDepth: DEFAULT_STOCKFISH_DEPTH,
+    stockfishPreset: "custom",
+    aiLevelId: "pathetic",
+  });
+
+  const stockfishRef = useRef({
+    worker: null,
+    ready: false,
+    readyResolvers: [],
+    readyRejectors: [],
+    pendingSearch: null,
   });
 
   const refresh = useCallback(() => {
@@ -90,8 +161,199 @@ function Chess3D() {
       aiThinking: s.aiThinking || false,
       timeControlId: s.timeControlId,
       clockMs: { ...s.clockMs },
+      aiMode: s.aiMode,
+      aiDepth: s.aiDepth,
+      aiPreset: s.aiPreset,
+      aiLevelId: s.aiLevelId,
+      openingWhite: s.openingWhite,
+      openingBlack: s.openingBlack,
     });
   }, []);
+
+  const terminateStockfish = useCallback(() => {
+    const state = stockfishRef.current;
+
+    if (state.pendingSearch?.reject) {
+      state.pendingSearch.reject(new Error("search-cancelled"));
+      state.pendingSearch = null;
+    }
+
+    if (state.readyRejectors.length) {
+      for (const rejectReady of state.readyRejectors) {
+        rejectReady(new Error("engine-terminated"));
+      }
+    }
+
+    state.ready = false;
+    state.readyResolvers = [];
+    state.readyRejectors = [];
+
+    if (state.worker) {
+      try { state.worker.terminate(); } catch {}
+      state.worker = null;
+    }
+  }, []);
+
+  const ensureStockfishReady = useCallback(async () => {
+    const state = stockfishRef.current;
+
+    if (!state.worker) {
+      const worker = new Worker(STOCKFISH_WORKER_PATH);
+      state.worker = worker;
+      state.ready = false;
+
+      worker.addEventListener("message", (event) => {
+        const line = String(event.data ?? "").trim();
+        if (!line) return;
+
+        if (line === "uciok") {
+          try { worker.postMessage("isready"); } catch {}
+          return;
+        }
+
+        if (line === "readyok") {
+          state.ready = true;
+          const waiters = [...state.readyResolvers];
+          state.readyResolvers = [];
+          state.readyRejectors = [];
+          for (const resolveReady of waiters) resolveReady(worker);
+          return;
+        }
+
+        if (line.startsWith("bestmove ")) {
+          if (!state.pendingSearch) return;
+          const move = line.split(/\s+/)[1] ?? "";
+          const pending = state.pendingSearch;
+          state.pendingSearch = null;
+          pending.resolve(move);
+        }
+      });
+
+      worker.addEventListener("error", () => {
+        const err = new Error("stockfish-worker-error");
+
+        if (state.pendingSearch?.reject) {
+          state.pendingSearch.reject(err);
+          state.pendingSearch = null;
+        }
+
+        if (state.readyRejectors.length) {
+          for (const rejectReady of state.readyRejectors) rejectReady(err);
+        }
+
+        state.ready = false;
+        state.readyResolvers = [];
+        state.readyRejectors = [];
+
+        try { worker.terminate(); } catch {}
+        if (state.worker === worker) state.worker = null;
+      });
+
+      try {
+        worker.postMessage("uci");
+      } catch {
+        terminateStockfish();
+        throw new Error("stockfish-init-failed");
+      }
+    }
+
+    if (state.ready && state.worker) return state.worker;
+
+    return await new Promise((resolve, reject) => {
+      const currentWorker = state.worker;
+      if (!currentWorker) {
+        reject(new Error("stockfish-missing-worker"));
+        return;
+      }
+
+      const timeout = setTimeout(() => {
+        state.readyResolvers = state.readyResolvers.filter((fn) => fn !== onReady);
+        state.readyRejectors = state.readyRejectors.filter((fn) => fn !== onFail);
+        reject(new Error("stockfish-ready-timeout"));
+      }, 12_000);
+
+      const onReady = (worker) => {
+        clearTimeout(timeout);
+        resolve(worker);
+      };
+
+      const onFail = (err) => {
+        clearTimeout(timeout);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      };
+
+      state.readyResolvers.push(onReady);
+      state.readyRejectors.push(onFail);
+
+      try {
+        currentWorker.postMessage("isready");
+      } catch {
+        clearTimeout(timeout);
+        state.readyResolvers = state.readyResolvers.filter((fn) => fn !== onReady);
+        state.readyRejectors = state.readyRejectors.filter((fn) => fn !== onFail);
+        reject(new Error("stockfish-ready-post-failed"));
+      }
+    });
+  }, [terminateStockfish]);
+
+  const applyStockfishPreset = useCallback((worker, presetId) => {
+    const preset = resolveAiPreset(presetId);
+    worker.postMessage("setoption name Ponder value false");
+    worker.postMessage("setoption name Threads value 1");
+    worker.postMessage("setoption name Skill Level value " + preset.skill);
+
+    if (preset.limitStrength && Number.isFinite(preset.elo)) {
+      worker.postMessage("setoption name UCI_LimitStrength value true");
+      worker.postMessage("setoption name UCI_Elo value " + preset.elo);
+    } else {
+      worker.postMessage("setoption name UCI_LimitStrength value false");
+    }
+  }, []);
+
+  const requestStockfishBestMove = useCallback(async (fen, depth, presetId) => {
+    const worker = await ensureStockfishReady();
+    const state = stockfishRef.current;
+
+    if (state.pendingSearch) {
+      try { worker.postMessage("stop"); } catch {}
+      state.pendingSearch.reject(new Error("search-superseded"));
+      state.pendingSearch = null;
+    }
+
+    const safeDepth = clampStockfishDepth(depth);
+    applyStockfishPreset(worker, presetId);
+
+    return await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        if (state.pendingSearch?.reject === rejectSearch) {
+          state.pendingSearch = null;
+        }
+        try { worker.postMessage("stop"); } catch {}
+        reject(new Error("stockfish-search-timeout"));
+      }, 15_000);
+
+      const resolveSearch = (bestMove) => {
+        clearTimeout(timeout);
+        resolve(bestMove);
+      };
+
+      const rejectSearch = (err) => {
+        clearTimeout(timeout);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      };
+
+      state.pendingSearch = { resolve: resolveSearch, reject: rejectSearch };
+
+      try {
+        worker.postMessage("position fen " + fen);
+        worker.postMessage("go depth " + safeDepth);
+      } catch (e) {
+        clearTimeout(timeout);
+        state.pendingSearch = null;
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    });
+  }, [ensureStockfishReady, applyStockfishPreset]);
 
   // Sync board → 3D scene
   const syncBoard = useCallback(() => {
@@ -267,6 +529,11 @@ function Chess3D() {
     s.selected = null;
     s.legalMovesList = [];
     s.aiThinking = false;
+    if (s.aiTimerId) {
+      clearTimeout(s.aiTimerId);
+      s.aiTimerId = null;
+    }
+    s.aiThinkToken += 1;
     s.clockLastTickAt = 0;
 
     if (typeof s.clockMs[color] === "number") {
@@ -344,6 +611,7 @@ function Chess3D() {
     const isCapture = !!(captured || isEP);
     const isCastle = legal[2] === "castleK" || legal[2] === "castleQ";
     const newBoard = applyMove(s.board, [fr, fc], legal, s.ep);
+    const uciMove = moveToUci([fr, fc], legal, piece);
 
     // Track captures — attacker colour captures the victim
     if (captured) s.captured[piece.color].push({ type: captured.type, color: captured.color });
@@ -354,6 +622,15 @@ function Chess3D() {
     if (piece.type === P.PAWN && Math.abs(legal[0] - fr) === 2) {
       newEp = [(fr + legal[0]) / 2, legal[1]];
     }
+
+    if (piece.type === P.PAWN || isCapture) s.halfmoveClock = 0;
+    else s.halfmoveClock += 1;
+    if (piece.color === B) s.fullmoveNumber += 1;
+
+    if (uciMove) s.moveHistory = [...s.moveHistory, uciMove];
+    const opening = describeOpening(s.moveHistory);
+    s.openingWhite = opening.white;
+    s.openingBlack = opening.black;
 
     s.board = newBoard;
     s.ep = newEp;
@@ -405,6 +682,11 @@ function Chess3D() {
     s.selected = null;
     s.legalMovesList = [];
     s.aiThinking = false;
+    if (s.aiTimerId) {
+      clearTimeout(s.aiTimerId);
+      s.aiTimerId = null;
+    }
+    s.aiThinkToken += 1;
     s.clockLastTickAt = 0;
 
     if (relay && s.mode === "net" && s.netClient && s.netPeerId) {
@@ -418,30 +700,92 @@ function Chess3D() {
   const aiMove = useCallback(() => {
     const s = sr.current;
     if (s.status === "checkmate" || s.status === "stalemate" || s.status === "resigned" || s.status === "timeout") return;
+
     const moves = allLegalMoves(s.board, s.turn, s.ep);
     if (!moves.length) return;
-    // Gaussian-ish delay: base 800 ms + up to 1 400 ms extra, feels more human
-    const delay = 800 + Math.random() * 900 + Math.random() * 500;
+
+    s.aiThinkToken += 1;
+    const thinkToken = s.aiThinkToken;
+
+    if (s.aiTimerId) {
+      clearTimeout(s.aiTimerId);
+      s.aiTimerId = null;
+    }
+
+    const delay =
+      s.aiMode === AI_MODE_STOCKFISH
+        ? 220 + Math.random() * 220
+        : 800 + Math.random() * 900 + Math.random() * 500;
+
     s.aiThinking = true;
-    setUi(v => ({ ...v, aiThinking: true }));
-    setTimeout(() => {
-      if (
-        sr.current.status === "checkmate" ||
-        sr.current.status === "stalemate" ||
-        sr.current.status === "resigned" ||
-        sr.current.status === "timeout" ||
-        sr.current.turn === sr.current.playerColor
-      ) { // player moved again somehow or game ended
+    setUi((v) => ({ ...v, aiThinking: true }));
+
+    s.aiTimerId = setTimeout(async () => {
+      sr.current.aiTimerId = null;
+
+      const stale = () => {
+        const cur = sr.current;
+        return (
+          cur.aiThinkToken !== thinkToken ||
+          cur.status === "checkmate" ||
+          cur.status === "stalemate" ||
+          cur.status === "resigned" ||
+          cur.status === "timeout" ||
+          cur.turn === cur.playerColor
+        );
+      };
+
+      if (stale()) {
         sr.current.aiThinking = false;
-        setUi(v => ({ ...v, aiThinking: false }));
+        setUi((v) => ({ ...v, aiThinking: false }));
         return;
       }
-      const mv = moves[Math.floor(Math.random() * moves.length)];
+
+      let chosenMove = null;
+
+      if (sr.current.aiMode === AI_MODE_STOCKFISH) {
+        try {
+          const fen = boardToFen(
+            sr.current.board,
+            sr.current.turn,
+            sr.current.ep,
+            sr.current.halfmoveClock,
+            sr.current.fullmoveNumber
+          );
+          const bestMove = await requestStockfishBestMove(
+            fen,
+            sr.current.aiDepth,
+            sr.current.aiPreset
+          );
+
+          if (bestMove && bestMove !== "(none)") {
+            chosenMove = uciToMove(bestMove, sr.current.board, sr.current.ep);
+          }
+        } catch (err) {
+          console.warn("Stockfish search failed, using random fallback", err);
+        }
+      }
+
+      if (stale()) {
+        sr.current.aiThinking = false;
+        setUi((v) => ({ ...v, aiThinking: false }));
+        return;
+      }
+
+      if (!chosenMove) {
+        const fallback = allLegalMoves(sr.current.board, sr.current.turn, sr.current.ep);
+        if (fallback.length) {
+          const mv = fallback[Math.floor(Math.random() * fallback.length)];
+          chosenMove = { from: mv.from, to: mv.to };
+        }
+      }
+
       sr.current.aiThinking = false;
-      setUi(v => ({ ...v, aiThinking: false }));
-      doMove(mv.from, mv.to);
+      setUi((v) => ({ ...v, aiThinking: false }));
+
+      if (chosenMove) doMove(chosenMove.from, chosenMove.to);
     }, delay);
-  }, [doMove]);
+  }, [doMove, requestStockfishBestMove]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -949,8 +1293,13 @@ function Chess3D() {
       // Close any open network connections
       try { sr.current.netClient?.close(); } catch {}
       try { sr.current.presenceClient?.close(); } catch {}
+      if (sr.current.aiTimerId) {
+        clearTimeout(sr.current.aiTimerId);
+        sr.current.aiTimerId = null;
+      }
+      terminateStockfish();
     };
-  }, []);
+  }, [terminateStockfish]);
 
   // startGameRef avoids circular dependency: hostGame is defined before startGame
   const startGameRef = useRef(null);
@@ -1327,11 +1676,22 @@ function Chess3D() {
   }, [net.incomingChallenge, net.playerName]);
 
   // Start / restart game
-  const startGame = useCallback((mode, playerColor = W, timeControlId = "casual") => {
+  const startGame = useCallback((mode, playerColor = W, timeControlId = "casual", aiConfig = null) => {
     const s = sr.current;
     const timeControl = resolveTimeControl(timeControlId);
 
     if (mode !== "net") disconnectNet();
+
+    const nextAiMode = aiConfig?.mode ?? s.aiMode ?? AI_MODE_RANDOM;
+    const nextAiPreset = aiConfig?.preset ?? s.aiPreset ?? "custom";
+    const nextAiDepth = clampStockfishDepth(aiConfig?.depth ?? s.aiDepth ?? DEFAULT_STOCKFISH_DEPTH);
+    const nextAiLevelId = aiConfig?.levelId ?? s.aiLevelId ?? "pathetic";
+
+    if (s.aiTimerId) {
+      clearTimeout(s.aiTimerId);
+      s.aiTimerId = null;
+    }
+    s.aiThinkToken += 1;
 
     s.board = mkBoard();
     s.turn = W;
@@ -1350,6 +1710,21 @@ function Chess3D() {
     s.clockLastTickAt = timeControl.initialMs == null ? 0 : performance.now();
     s.aiThinking = false;
     s.captured = { [W]: [], [B]: [] };
+    s.moveHistory = [];
+    s.halfmoveClock = 0;
+    s.fullmoveNumber = 1;
+    const opening = describeOpening([]);
+    s.openingWhite = opening.white;
+    s.openingBlack = opening.black;
+
+    s.aiMode = nextAiMode;
+    s.aiDepth = nextAiDepth;
+    s.aiPreset = nextAiPreset;
+    s.aiLevelId = nextAiLevelId;
+
+    if (mode !== "pvai" || nextAiMode === AI_MODE_RANDOM) {
+      terminateStockfish();
+    }
 
     s.spherical.theta = playerColor === W ? 0 : Math.PI;
     s.spherical.phi = 0.85;
@@ -1363,12 +1738,23 @@ function Chess3D() {
 
     setPresenceStatus(mode === "net" ? "playing" : "lobby");
 
+    if (mode === "pvai" && nextAiMode === AI_MODE_STOCKFISH) {
+      ensureStockfishReady()
+        .then((worker) => {
+          worker.postMessage("ucinewgame");
+          worker.postMessage("isready");
+        })
+        .catch(() => {
+          // Fallback to random in aiMove if engine fails.
+        });
+    }
+
     if (mode === "pvai" && playerColor === B) {
       setTimeout(() => {
         if (sr.current.turn !== sr.current.playerColor) aiMove();
       }, 600);
     }
-  }, [syncBoard, syncHighlights, syncGraveyard, refresh, aiMove, disconnectNet, setPresenceStatus]);
+  }, [syncBoard, syncHighlights, syncGraveyard, refresh, aiMove, disconnectNet, setPresenceStatus, ensureStockfishReady, terminateStockfish]);
 
   // Keep ref in sync so hostGame/joinGame can call startGame without circular dep
   startGameRef.current = startGame;
@@ -1516,6 +1902,12 @@ function Chess3D() {
     ui.status === "timeout";
   const activeTimeControl = resolveTimeControl(ui.timeControlId);
   const hasClock = activeTimeControl.initialMs != null;
+  const currentAiPreset = resolveAiPreset(ui.aiPreset);
+  const currentAiLevel = resolveAiLevel(ui.aiLevelId);
+  const aiSummary =
+    ui.aiMode === AI_MODE_RANDOM
+      ? "Pathetic (random moves)"
+      : (currentAiLevel.label + " · " + currentAiPreset.label + " · depth " + ui.aiDepth);
 
   const btn = (label, onClick, color = "#8b6914", extra = {}) => (
     <button onClick={onClick} style={{
@@ -1613,6 +2005,28 @@ function Chess3D() {
           }}>
             <span style={{ animation: "pulse 1s ease-in-out infinite" }}>●</span>
             AI is thinking…
+          </div>
+        )}
+
+        {ui.mode === "pvai" && (
+          <div style={{
+            padding: "5px 12px", borderRadius: "20px", fontSize: "0.8em",
+            background: "rgba(30,50,90,0.35)", border: "1px solid #355a95",
+            color: "#9bc2ff",
+          }}>
+            AI: {aiSummary}
+          </div>
+        )}
+
+        {ui.mode && (
+          <div style={{
+            display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap",
+            padding: "5px 12px", borderRadius: "10px",
+            background: "rgba(255,255,255,0.04)", border: "1px solid #3a2f1a",
+            color: "#c9b38b", fontSize: "0.76em",
+          }}>
+            <span>White opening: {ui.openingWhite}</span>
+            <span>Black defense: {ui.openingBlack}</span>
           </div>
         )}
 
@@ -1725,14 +2139,54 @@ function Chess3D() {
                   ))}
                 </select>
               </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "6px", textAlign: "left" }}>
+                <div style={{ color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" }}>AI DIFFICULTY</div>
+                <select
+                  style={timeSelectStyle}
+                  value={net.aiLevelId}
+                  onChange={e => {
+                    const level = resolveAiLevel(e.target.value);
+                    setNet(v => ({
+                      ...v,
+                      aiLevelId: level.id,
+                      aiMode: level.mode,
+                      stockfishPreset: level.preset,
+                      stockfishDepth: clampStockfishDepth(level.depth),
+                    }));
+                  }}
+                >
+                  {AI_LEVELS.map((level) => (
+                    <option key={level.id} value={level.id}>{level.label}</option>
+                  ))}
+                </select>
+                <div style={{ color: "#6a5a3a", fontSize: "0.72em" }}>
+                  {resolveAiLevel(net.aiLevelId).note}
+                </div>
+              </div>
+
+              {net.aiMode === AI_MODE_STOCKFISH && (
+                <div style={{ display: "flex", flexDirection: "column", gap: "6px", textAlign: "left" }}>
+                  <div style={{ color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" }}>
+                    STOCKFISH DEPTH ({net.stockfishDepth})
+                  </div>
+                  <input
+                    type="range"
+                    min={STOCKFISH_DEPTH_MIN}
+                    max={STOCKFISH_DEPTH_MAX}
+                    value={net.stockfishDepth}
+                    onChange={e => setNet(v => ({ ...v, aiMode: AI_MODE_STOCKFISH, stockfishDepth: clampStockfishDepth(e.target.value) }))}
+                  />
+                </div>
+              )}
+
               {btn("♟♟  Player vs Player", () => startGame("pvp", W, net.timeControlId), "#5c3d1e")}
-              {btn("⚪  Play as White vs AI", () => startGame("pvai", W, net.timeControlId), "#1a3a1a")}
-              {btn("⚫  Play as Black vs AI", () => startGame("pvai", B, net.timeControlId), "#1a1a3a")}
+              {btn("⚪  Play as White vs AI", () => startGame("pvai", W, net.timeControlId, { mode: net.aiMode, depth: net.stockfishDepth, preset: net.stockfishPreset, levelId: net.aiLevelId }), "#1a3a1a")}
+              {btn("⚫  Play as Black vs AI", () => startGame("pvai", B, net.timeControlId, { mode: net.aiMode, depth: net.stockfishDepth, preset: net.stockfishPreset, levelId: net.aiLevelId }), "#1a1a3a")}
               <div style={{ borderTop: "1px solid #2a1f0a", margin: "4px 0" }} />
               {btn("🌐  Play Online", () => openOnlineLobby(), "#1a2040")}
             </div>
             <p style={{ color: "#3a3020", margin: "22px 0 0", fontSize: "0.75em" }}>
-              AI plays random legal moves — improve it yourself!
+              Pathetic = random. Higher levels use Stockfish presets + adjustable depth.
             </p>
           </div>
         </div>

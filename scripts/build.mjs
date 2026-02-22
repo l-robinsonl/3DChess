@@ -16,6 +16,11 @@ const staticScriptFiles = [
   "p2p-mesh-client.js",
 ];
 
+const stockfishFiles = [
+  "stockfish-18-lite-single.js",
+  "stockfish-18-lite-single.wasm",
+];
+
 const html = `<!doctype html>
 <html lang="en">
   <head>
@@ -88,6 +93,11 @@ await build({
   jsxFragment: "React.Fragment",
   logLevel: "info",
 });
+
+const stockfishBinDir = path.join(rootDir, "node_modules", "stockfish", "bin");
+for (const file of stockfishFiles) {
+  await fs.copyFile(path.join(stockfishBinDir, file), path.join(distDir, file));
+}
 
 await fs.copyFile(path.join(rootDir, "chesspiecemove.mp3"), path.join(distDir, "chesspiecemove.mp3"));
 await fs.writeFile(path.join(distDir, "chess.html"), html, "utf8");
