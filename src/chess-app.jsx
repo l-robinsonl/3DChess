@@ -54,8 +54,6 @@ function Chess3D() {
     code: "",          // host's generated room code
     inputCode: "",     // joiner's typed code
     timeControlId: "blitz",
-    signalUrlInput: getSignalUrl(),
-    activeSignalUrl: "",
     peerStatus: "",    // "" | "waiting" | "connected" | "disconnected"
     statusMsg: "",     // human-readable connection status
     error: "",
@@ -944,12 +942,8 @@ function Chess3D() {
   }, []);
 
   // Host: generate code, connect, wait for peer's data channel to open, then begin
-  const hostGame = useCallback(async (signalServerInput, timeControlIdInput) => {
-    const signalUrl = getSignalUrl(signalServerInput);
-    if (!signalUrl) {
-      setNet(v => ({ ...v, error: "Invalid signaling server URL" }));
-      return;
-    }
+  const hostGame = useCallback(async (timeControlIdInput) => {
+    const signalUrl = getSignalUrl();
     const timeControl = resolveTimeControl(timeControlIdInput);
     const code = genRoomCode();
     setNet(v => ({
@@ -958,7 +952,6 @@ function Chess3D() {
       code,
       timeControlId: timeControl.id,
       peerStatus: "waiting",
-      activeSignalUrl: signalUrl,
       error: "",
       statusMsg: "Connecting to server…",
     }));
@@ -980,23 +973,18 @@ function Chess3D() {
     });
     s.netClient = client; s.netRole = "host";
     try { await client.connect(); }
-    catch (e) { setNet(v => ({ ...v, screen: "lobby", error: `Could not reach server (${signalUrl}): ${e.message}`, statusMsg: "", activeSignalUrl: "" })); disconnectNet(); }
+    catch (e) { setNet(v => ({ ...v, screen: "lobby", error: `Could not reach signaling server: `, statusMsg: "" })); disconnectNet(); }
   }, [disconnectNet]);
 
   // Join: connect with given code, wait for host's "start" message
-  const joinGame = useCallback(async (code, signalServerInput) => {
+  const joinGame = useCallback(async (code) => {
     const clean = code.trim().toUpperCase();
     if (!clean) { setNet(v => ({ ...v, error: "Enter a room code" })); return; }
-    const signalUrl = getSignalUrl(signalServerInput);
-    if (!signalUrl) {
-      setNet(v => ({ ...v, error: "Invalid signaling server URL" }));
-      return;
-    }
+    const signalUrl = getSignalUrl();
     setNet(v => ({
       ...v,
       screen: "joining",
       peerStatus: "waiting",
-      activeSignalUrl: signalUrl,
       error: "",
       statusMsg: "Connecting to server…",
     }));
@@ -1012,7 +1000,7 @@ function Chess3D() {
     });
     s.netClient = client; s.netRole = "join";
     try { await client.connect(); }
-    catch (e) { setNet(v => ({ ...v, screen: "lobby", error: `Could not reach server (${signalUrl}): ${e.message}`, statusMsg: "", activeSignalUrl: "" })); disconnectNet(); }
+    catch (e) { setNet(v => ({ ...v, screen: "lobby", error: `Could not reach signaling server: `, statusMsg: "" })); disconnectNet(); }
   }, [disconnectNet]);
 
   // Start / restart game
@@ -1305,7 +1293,7 @@ function Chess3D() {
               {btn("⚪  Play as White vs AI", () => startGame("pvai", W, net.timeControlId), "#1a3a1a")}
               {btn("⚫  Play as Black vs AI", () => startGame("pvai", B, net.timeControlId), "#1a1a3a")}
               <div style={{ borderTop: "1px solid #2a1f0a", margin: "4px 0" }} />
-              {btn("🌐  Play Online", () => setNet(v => ({ ...v, screen: "lobby", inputCode: "", activeSignalUrl: "", error: "" })), "#1a2040")}
+              {btn("🌐  Play Online", () => setNet(v => ({ ...v, screen: "lobby", inputCode: "", error: "" })), "#1a2040")}
             </div>
             <p style={{ color: "#3a3020", margin: "22px 0 0", fontSize: "0.75em" }}>
               AI plays random legal moves — improve it yourself!
@@ -1344,19 +1332,7 @@ function Chess3D() {
                   Host selection is used for both players.
                 </div>
               </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: "6px", textAlign: "left" }}>
-                <div style={{ color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" }}>SIGNALING SERVER</div>
-                <input
-                  style={serverInputStyle}
-                  placeholder="hubertblu.pagekite.me or ws://localhost:8787/ws"
-                  value={net.signalUrlInput}
-                  onChange={e => setNet(v => ({ ...v, signalUrlInput: e.target.value, error: "" }))}
-                />
-                <div style={{ color: "#6a5a3a", fontSize: "0.73em", wordBreak: "break-all" }}>
-                  Leave blank to use this page host: {getSignalUrl("")}
-                </div>
-              </div>
-              {btn("♟  Host a Game (play as White)", () => hostGame(net.signalUrlInput, net.timeControlId), "#1a3a2a")}
+              {btn("♟  Host a Game (play as White)", () => hostGame(net.timeControlId), "#1a3a2a")}
               <div style={{ borderTop: "1px solid #2a1f0a", margin: "2px 0" }} />
               <input
                 style={inputStyle}
@@ -1364,9 +1340,9 @@ function Chess3D() {
                 maxLength={6}
                 value={net.inputCode}
                 onChange={e => setNet(v => ({ ...v, inputCode: e.target.value.toUpperCase(), error: "" }))}
-                onKeyDown={e => e.key === "Enter" && joinGame(net.inputCode, net.signalUrlInput)}
+                onKeyDown={e => e.key === "Enter" && joinGame(net.inputCode)}
               />
-              {btn("Join Game", () => joinGame(net.inputCode, net.signalUrlInput), "#1a2a3a")}
+              {btn("Join Game", () => joinGame(net.inputCode), "#1a2a3a")}
             </div>
             <div style={{ marginTop: "20px" }}>
               {btn("← Back", () => setNet(v => ({ ...v, screen: null })), "#2a2010", { fontSize: "0.85em", padding: "8px 18px" })}
@@ -1381,9 +1357,6 @@ function Chess3D() {
           <div style={cardStyle}>
             <div style={{ fontSize: "2.5em", marginBottom: "12px" }}>⏳</div>
             <h2 style={{ margin: "0 0 8px", color: "#d4a843" }}>Waiting for Opponent</h2>
-            <div style={{ color: "#7d6e4f", fontSize: "0.72em", margin: "0 0 10px", wordBreak: "break-all" }}>
-              Server: {net.activeSignalUrl || "not set"}
-            </div>
             <div style={{ color: "#7d6e4f", fontSize: "0.72em", margin: "0 0 10px" }}>
               Clock: {resolveTimeControl(net.timeControlId).label}
             </div>
@@ -1414,9 +1387,6 @@ function Chess3D() {
             <div style={{ fontSize: "2em", marginBottom: "12px",
               display: "inline-block", animation: "spin 1.2s linear infinite" }}>⚙</div>
             <h2 style={{ margin: "0 0 16px", color: "#d4a843" }}>Joining Game…</h2>
-            <div style={{ color: "#7d6e4f", fontSize: "0.72em", margin: "0 0 10px", wordBreak: "break-all" }}>
-              Server: {net.activeSignalUrl || "not set"}
-            </div>
             <div style={{ color: "#7d6e4f", fontSize: "0.72em", margin: "0 0 10px" }}>
               Clock: {resolveTimeControl(net.timeControlId).label}
             </div>

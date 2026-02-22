@@ -1,0 +1,29 @@
+{
+  "name": "3dchess",
+  "version": "1.0.0",
+  "description": "3D chess client with local, AI, and online P2P modes.",
+  "main": "index.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "serve": "python3 -m http.server 8080 --directory dist",
+    "cf:dev": "wrangler dev",
+    "cf:deploy": "npm run build && wrangler deploy",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/l-robinsonl/3DChess.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/l-robinsonl/3DChess/issues"
+  },
+  "homepage": "https://github.com/l-robinsonl/3DChess#readme",
+  "devDependencies": {
+    "esbuild": "^0.27.3",
+    "wrangler": "^4.5.0"
+  }
+}

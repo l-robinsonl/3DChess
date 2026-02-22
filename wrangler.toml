@@ -1,0 +1,7 @@
+name = "3dchess-site"
+main = "worker-site.js"
+compatibility_date = "2026-02-22"
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
