@@ -24,7 +24,7 @@
       ];
       const AI_PRESET_MAP = Object.fromEntries(AI_PRESETS.map((preset) => [preset.id, preset]));
       const AI_LEVELS = [
-        { id: "pathetic", label: "Pathetic (Random)", mode: AI_MODE_RANDOM, preset: "custom", depth: 1, note: "Pure random legal moves." },
+        { id: "pathetic", label: "Pathetic", mode: AI_MODE_RANDOM, preset: "custom", depth: 1, note: "Pure random legal moves." },
         { id: "novice", label: "Novice", mode: AI_MODE_STOCKFISH, preset: "beginner", depth: 4, note: "Makes obvious mistakes." },
         { id: "easy", label: "Easy", mode: AI_MODE_STOCKFISH, preset: "beginner", depth: 6, note: "Beginner-friendly Stockfish." },
         { id: "medium", label: "Medium", mode: AI_MODE_STOCKFISH, preset: "club", depth: 9, note: "Club-level challenge." },
@@ -75,6 +75,7 @@
           fullmoveNumber: 1,
           openingWhite: "Start Position",
           openingBlack: "Awaiting White move",
+          lastOpponentMove: null,
           aiMode: AI_MODE_RANDOM,
           aiDepth: DEFAULT_STOCKFISH_DEPTH,
           aiPreset: "custom",
@@ -425,6 +426,28 @@
           if (!s.scene) return;
           s.highlights.forEach((m) => s.scene.remove(m));
           s.highlights = [];
+          if (s.lastOpponentMove) {
+            const markers = [
+              { sq: s.lastOpponentMove.from, color: 16747109, opacity: 0.38 },
+              { sq: s.lastOpponentMove.to, color: 7128063, opacity: 0.48 }
+            ];
+            for (const marker of markers) {
+              const [mr, mc] = marker.sq || [];
+              if (!Number.isInteger(mr) || !Number.isInteger(mc)) continue;
+              const hm = new THREE.Mesh(
+                new THREE.BoxGeometry(0.98, 0.02, 0.98),
+                new THREE.MeshPhongMaterial({
+                  color: marker.color,
+                  transparent: true,
+                  opacity: marker.opacity,
+                  depthWrite: false
+                })
+              );
+              hm.position.set(mc - 3.5, 0.055, mr - 3.5);
+              s.scene.add(hm);
+              s.highlights.push(hm);
+            }
+          }
           if (s.selected) {
             const [sr2, sc] = s.selected;
             const hm = new THREE.Mesh(
@@ -554,6 +577,10 @@
             return wanted === got;
           });
           if (!legal) return false;
+          const movedByOpponent = (s.mode === "net" || s.mode === "pvai") && piece.color !== s.playerColor;
+          if (movedByOpponent) {
+            s.lastOpponentMove = { from: [fr, fc], to: [legal[0], legal[1]], color: piece.color };
+          }
           const captured = s.board[legal[0]][legal[1]];
           const isEP = piece.type === P.PAWN && s.ep && legal[0] === s.ep[0] && legal[1] === s.ep[1];
           const epPiece = isEP ? s.board[fr][legal[1]] : null;
@@ -1514,6 +1541,7 @@
           const opening = describeOpening([]);
           s.openingWhite = opening.white;
           s.openingBlack = opening.black;
+          s.lastOpponentMove = null;
           s.aiMode = nextAiMode;
           s.aiDepth = nextAiDepth;
           s.aiPreset = nextAiPreset;
@@ -1664,7 +1692,7 @@
         const hasClock = activeTimeControl.initialMs != null;
         const currentAiPreset = resolveAiPreset(ui.aiPreset);
         const currentAiLevel = resolveAiLevel(ui.aiLevelId);
-        const aiSummary = ui.aiMode === AI_MODE_RANDOM ? "Pathetic (random moves)" : currentAiLevel.label + " \xB7 " + currentAiPreset.label + " \xB7 depth " + ui.aiDepth;
+        const aiSummary = ui.aiMode === AI_MODE_RANDOM ? "Pathetic" : currentAiLevel.label + " \xB7 " + currentAiPreset.label + " \xB7 depth " + ui.aiDepth;
         const btn = (label, onClick, color = "#8b6914", extra = {}) => /* @__PURE__ */ React.createElement(
           "button",
           {
@@ -1898,7 +1926,7 @@
             value: net.stockfishDepth,
             onChange: (e) => setNet((v) => ({ ...v, aiMode: AI_MODE_STOCKFISH, stockfishDepth: clampStockfishDepth(e.target.value) }))
           }
-        )), btn("\u265F\u265F  Player vs Player", () => startGame("pvp", W, net.timeControlId), "#5c3d1e"), btn("\u26AA  Play as White vs AI", () => startGame("pvai", W, net.timeControlId, { mode: net.aiMode, depth: net.stockfishDepth, preset: net.stockfishPreset, levelId: net.aiLevelId }), "#1a3a1a"), btn("\u26AB  Play as Black vs AI", () => startGame("pvai", B, net.timeControlId, { mode: net.aiMode, depth: net.stockfishDepth, preset: net.stockfishPreset, levelId: net.aiLevelId }), "#1a1a3a"), /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid #2a1f0a", margin: "4px 0" } }), btn("\u{1F310}  Play Online", () => openOnlineLobby(), "#1a2040")), /* @__PURE__ */ React.createElement("p", { style: { color: "#3a3020", margin: "22px 0 0", fontSize: "0.75em" } }, "Pathetic = random. Higher levels use Stockfish presets + adjustable depth."))), net.screen === "lobby" && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: { ...cardStyle, minWidth: "560px", maxWidth: "760px", width: "92vw" } }, /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 6px", color: "#d4a843", fontSize: "1.6em" } }, "\u{1F310} Online Lobby"), /* @__PURE__ */ React.createElement("p", { style: { color: "#6a5a3a", margin: "0 0 18px", fontSize: "0.82em" } }, "Signed in as ", /* @__PURE__ */ React.createElement("strong", null, net.playerName || "Player"), " \xB7 ", net.presenceState === "online" ? "connected" : net.presenceState), net.error && /* @__PURE__ */ React.createElement("div", { style: { color: "#ff8888", background: "rgba(80,0,0,0.4)", border: "1px solid #aa3333", borderRadius: "8px", padding: "8px 14px", marginBottom: "14px", fontSize: "0.85em" } }, net.error), net.incomingChallenge && /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid #6b4f10", borderRadius: "10px", padding: "12px", marginBottom: "14px", background: "rgba(60,40,10,0.35)" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#f0d9b5", marginBottom: "8px", fontSize: "0.94em" } }, "Challenge from ", /* @__PURE__ */ React.createElement("strong", null, net.incomingChallenge.fromName), " (", resolveTimeControl(net.incomingChallenge.timeControlId).label, ")"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: "10px", justifyContent: "center" } }, btn("Accept", () => acceptChallenge(), "#1a3a2a", { fontSize: "0.84em", padding: "8px 14px" }), btn("Decline", () => declineChallenge(), "#5a1f1f", { fontSize: "0.84em", padding: "8px 14px" }))), net.outgoingChallenge && /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid #2a5f9f", borderRadius: "10px", padding: "10px", marginBottom: "14px", background: "rgba(25,45,75,0.35)", color: "#9bc2ff", fontSize: "0.84em" } }, "Waiting for ", /* @__PURE__ */ React.createElement("strong", null, net.outgoingChallenge.toName), " to accept your challenge..."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: "6px", textAlign: "left", marginBottom: "10px" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" } }, "TIME CONTROL (for your outgoing challenge)"), /* @__PURE__ */ React.createElement(
+        )), btn("\u265F\u265F  Player vs Player", () => startGame("pvp", W, net.timeControlId), "#5c3d1e"), btn("\u26AA  Play as White vs AI", () => startGame("pvai", W, net.timeControlId, { mode: net.aiMode, depth: net.stockfishDepth, preset: net.stockfishPreset, levelId: net.aiLevelId }), "#1a3a1a"), btn("\u26AB  Play as Black vs AI", () => startGame("pvai", B, net.timeControlId, { mode: net.aiMode, depth: net.stockfishDepth, preset: net.stockfishPreset, levelId: net.aiLevelId }), "#1a1a3a"), /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid #2a1f0a", margin: "4px 0" } }), btn("\u{1F310}  Play Online", () => openOnlineLobby(), "#1a2040")), /* @__PURE__ */ React.createElement("p", { style: { color: "#3a3020", margin: "22px 0 0", fontSize: "0.75em" } }, "Pathetic = random. Higher levels use Stockfish presets + adjustable depth."))), net.screen === "lobby" && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: { ...cardStyle, minWidth: "560px", maxWidth: "760px", width: "92vw" } }, /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 6px", color: "#d4a843", fontSize: "1.6em" } }, "\u{1F310} Online Lobby"), /* @__PURE__ */ React.createElement("p", { style: { color: "#6a5a3a", margin: "0 0 18px", fontSize: "0.82em" } }, "Signed in as ", /* @__PURE__ */ React.createElement("strong", null, net.playerName || "Player"), " \xB7 ", net.presenceState === "online" ? "connected" : net.presenceState), net.error && /* @__PURE__ */ React.createElement("div", { style: { color: "#ff8888", background: "rgba(80,0,0,0.4)", border: "1px solid #aa3333", borderRadius: "8px", padding: "8px 14px", marginBottom: "14px", fontSize: "0.85em" } }, net.error), net.incomingChallenge && /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid #6b4f10", borderRadius: "10px", padding: "12px", marginBottom: "14px", background: "rgba(60,40,10,0.35)" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#f0d9b5", marginBottom: "8px", fontSize: "0.94em" } }, "Challenge from ", /* @__PURE__ */ React.createElement("strong", null, net.incomingChallenge.fromName), " (", resolveTimeControl(net.incomingChallenge.timeControlId).label, ")"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: "10px", justifyContent: "center" } }, btn("Accept", () => acceptChallenge(), "#1a3a2a", { fontSize: "0.84em", padding: "8px 14px" }), btn("Decline", () => declineChallenge(), "#5a1f1f", { fontSize: "0.84em", padding: "8px 14px" }))), net.outgoingChallenge && /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid #2a5f9f", borderRadius: "10px", padding: "10px", marginBottom: "14px", background: "rgba(25,45,75,0.35)", color: "#9bc2ff", fontSize: "0.84em" } }, "Waiting for ", /* @__PURE__ */ React.createElement("strong", null, net.outgoingChallenge.toName), " to accept your challenge..."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: "6px", textAlign: "left", marginBottom: "10px" } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" } }, "TIME CONTROL"), /* @__PURE__ */ React.createElement(
           "select",
           {
             style: timeSelectStyle,

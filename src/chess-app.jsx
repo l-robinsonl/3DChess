@@ -21,7 +21,7 @@ const AI_PRESETS = [
 const AI_PRESET_MAP = Object.fromEntries(AI_PRESETS.map((preset) => [preset.id, preset]));
 
 const AI_LEVELS = [
-  { id: "pathetic", label: "Pathetic (Random)", mode: AI_MODE_RANDOM, preset: "custom", depth: 1, note: "Pure random legal moves." },
+  { id: "pathetic", label: "Pathetic", mode: AI_MODE_RANDOM, preset: "custom", depth: 1, note: "Pure random legal moves." },
   { id: "novice", label: "Novice", mode: AI_MODE_STOCKFISH, preset: "beginner", depth: 4, note: "Makes obvious mistakes." },
   { id: "easy", label: "Easy", mode: AI_MODE_STOCKFISH, preset: "beginner", depth: 6, note: "Beginner-friendly Stockfish." },
   { id: "medium", label: "Medium", mode: AI_MODE_STOCKFISH, preset: "club", depth: 9, note: "Club-level challenge." },
@@ -75,6 +75,7 @@ function Chess3D() {
     fullmoveNumber: 1,
     openingWhite: "Start Position",
     openingBlack: "Awaiting White move",
+    lastOpponentMove: null,
     aiMode: AI_MODE_RANDOM,
     aiDepth: DEFAULT_STOCKFISH_DEPTH,
     aiPreset: "custom",
@@ -445,6 +446,31 @@ function Chess3D() {
     s.highlights.forEach(m => s.scene.remove(m));
     s.highlights = [];
 
+    if (s.lastOpponentMove) {
+      const markers = [
+        { sq: s.lastOpponentMove.from, color: 0xff8a65, opacity: 0.38 },
+        { sq: s.lastOpponentMove.to, color: 0x6cc3ff, opacity: 0.48 },
+      ];
+
+      for (const marker of markers) {
+        const [mr, mc] = marker.sq || [];
+        if (!Number.isInteger(mr) || !Number.isInteger(mc)) continue;
+
+        const hm = new THREE.Mesh(
+          new THREE.BoxGeometry(0.98, 0.02, 0.98),
+          new THREE.MeshPhongMaterial({
+            color: marker.color,
+            transparent: true,
+            opacity: marker.opacity,
+            depthWrite: false,
+          })
+        );
+        hm.position.set(mc - 3.5, 0.055, mr - 3.5);
+        s.scene.add(hm);
+        s.highlights.push(hm);
+      }
+    }
+
     if (s.selected) {
       const [sr2, sc] = s.selected;
       const hm = new THREE.Mesh(
@@ -604,6 +630,12 @@ function Chess3D() {
       return wanted === got;
     });
     if (!legal) return false;
+
+    const movedByOpponent =
+      (s.mode === "net" || s.mode === "pvai") && piece.color !== s.playerColor;
+    if (movedByOpponent) {
+      s.lastOpponentMove = { from: [fr, fc], to: [legal[0], legal[1]], color: piece.color };
+    }
 
     const captured = s.board[legal[0]][legal[1]];
     const isEP     = piece.type === P.PAWN && s.ep && legal[0] === s.ep[0] && legal[1] === s.ep[1];
@@ -1716,6 +1748,7 @@ function Chess3D() {
     const opening = describeOpening([]);
     s.openingWhite = opening.white;
     s.openingBlack = opening.black;
+    s.lastOpponentMove = null;
 
     s.aiMode = nextAiMode;
     s.aiDepth = nextAiDepth;
@@ -1906,7 +1939,7 @@ function Chess3D() {
   const currentAiLevel = resolveAiLevel(ui.aiLevelId);
   const aiSummary =
     ui.aiMode === AI_MODE_RANDOM
-      ? "Pathetic (random moves)"
+      ? "Pathetic"
       : (currentAiLevel.label + " · " + currentAiPreset.label + " · depth " + ui.aiDepth);
 
   const btn = (label, onClick, color = "#8b6914", extra = {}) => (
@@ -2226,7 +2259,7 @@ function Chess3D() {
             )}
 
             <div style={{ display: "flex", flexDirection: "column", gap: "6px", textAlign: "left", marginBottom: "10px" }}>
-              <div style={{ color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" }}>TIME CONTROL (for your outgoing challenge)</div>
+              <div style={{ color: "#8a7a58", fontSize: "0.72em", letterSpacing: "0.06em" }}>TIME CONTROL</div>
               <select
                 style={timeSelectStyle}
                 value={net.timeControlId}
