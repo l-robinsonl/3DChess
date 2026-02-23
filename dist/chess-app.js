@@ -8,6 +8,12 @@
       const { useState, useEffect, useRef, useCallback } = React;
       function Chess3D() {
         const mountRef = useRef(null);
+        const DEFAULT_VIEW_PHI = 0.78;
+        const DEFAULT_VIEW_RADIUS = 14;
+        const MIN_VIEW_RADIUS = 7.6;
+        const MAX_VIEW_RADIUS = 22;
+        const MIN_VIEW_PHI = 0.18;
+        const MAX_VIEW_PHI = 1.1;
         const sr = useRef({
           board: mkBoard(),
           turn: W,
@@ -53,7 +59,7 @@
           mouse: new THREE.Vector2(),
           squareMeshes: [],
           animId: null,
-          spherical: { theta: 0, phi: 0.85, radius: 14 },
+          spherical: { theta: 0, phi: DEFAULT_VIEW_PHI, radius: DEFAULT_VIEW_RADIUS },
           orbitActive: false,
           lastMouse: { x: 0, y: 0 },
           dragStart: null,
@@ -1134,13 +1140,16 @@
             }
             return labelTexCache.get(text);
           };
-          const LABEL_Y = -15e-4;
-          const LABEL_DIST = 4.17;
-          const LABEL_W = 0.56;
-          const LABEL_H = 0.24;
+          const LABEL_Y = 0.014;
+          const FILE_LABEL_NEAR_Z = -4.28;
+          const FILE_LABEL_FAR_Z = 4.3;
+          const RANK_LABEL_X = 4.28;
+          const SIDE_FILE_LABEL_X = 4.31;
+          const LABEL_W = 0.78;
+          const LABEL_H = 0.38;
           s.coordLabels = [];
           const coordGeo = new THREE.PlaneGeometry(LABEL_W, LABEL_H);
-          const addCoordLabel = (text, x, z, rotY, edgeNormal) => {
+          const addCoordLabel = (text, x, z, rotY, edgeNormal, scale = 1, glowBoost = 1) => {
             const texSet = getEtchedLabelSet(text);
             const mat = new THREE.MeshStandardMaterial({
               map: texSet.map,
@@ -1149,23 +1158,25 @@
               bumpMap: texSet.bumpMap,
               bumpScale: -0.03,
               transparent: true,
-              alphaTest: 0.06,
+              alphaTest: 0.02,
               depthWrite: false,
               polygonOffset: true,
               polygonOffsetFactor: -1,
               polygonOffsetUnits: -2,
               color: 16777215,
-              roughness: 0.72,
+              roughness: 0.56,
               metalness: 0.02,
-              emissive: new THREE.Color(15909498),
-              emissiveIntensity: 0.12,
+              emissive: new THREE.Color(16769453),
+              emissiveIntensity: 0.28 * glowBoost,
               side: THREE.DoubleSide
             });
             const mesh = new THREE.Mesh(coordGeo, mat);
             mesh.rotation.set(-Math.PI / 2, rotY, 0);
             mesh.position.set(x, LABEL_Y, z);
+            mesh.scale.set(scale, scale, 1);
             mesh.receiveShadow = true;
             mesh.userData.edgeNormal = edgeNormal.clone();
+            mesh.userData.glowBoost = glowBoost;
             scene.add(mesh);
             s.coordLabels.push(mesh);
           };
@@ -1173,16 +1184,21 @@
           const ranks = "87654321".split("");
           files.forEach((letter, i) => {
             const wx = i - 3.5;
-            addCoordLabel(letter, wx, LABEL_DIST, Math.PI, new THREE.Vector3(0, 0, 1));
-            addCoordLabel(letter, wx, -LABEL_DIST, 0, new THREE.Vector3(0, 0, -1));
+            addCoordLabel(letter, wx, FILE_LABEL_FAR_Z, Math.PI, new THREE.Vector3(0, 0, 1), 1.14, 1.2);
+            addCoordLabel(letter, wx, FILE_LABEL_NEAR_Z, 0, new THREE.Vector3(0, 0, -1), 1.08, 1.12);
           });
           ranks.forEach((rank, i) => {
             const wz = i - 3.5;
-            addCoordLabel(rank, LABEL_DIST, wz, -Math.PI / 2, new THREE.Vector3(1, 0, 0));
-            addCoordLabel(rank, -LABEL_DIST, wz, Math.PI / 2, new THREE.Vector3(-1, 0, 0));
+            addCoordLabel(rank, RANK_LABEL_X, wz, -Math.PI / 2, new THREE.Vector3(1, 0, 0), 1.08, 1.08);
+            addCoordLabel(rank, -RANK_LABEL_X, wz, Math.PI / 2, new THREE.Vector3(-1, 0, 0), 1.08, 1.08);
           });
-          const CAMERA_TARGET_Y = 0.34;
-          const CAMERA_LIFT_Y = 0.78;
+          files.forEach((letter, i) => {
+            const wz = i - 3.5;
+            addCoordLabel(letter, SIDE_FILE_LABEL_X, wz, -Math.PI / 2, new THREE.Vector3(1, 0, 0), 0.92, 1.15);
+            addCoordLabel(letter, -SIDE_FILE_LABEL_X, wz, Math.PI / 2, new THREE.Vector3(-1, 0, 0), 0.92, 1.15);
+          });
+          const CAMERA_TARGET_Y = -0.42;
+          const CAMERA_LIFT_Y = 1.62;
           const updateCam = () => {
             const { theta, phi, radius } = s.spherical;
             camera.position.set(
@@ -1208,7 +1224,7 @@
               const dx = e.clientX - s.lastMouse.x;
               const dy = e.clientY - s.lastMouse.y;
               s.spherical.theta -= dx * 8e-3;
-              s.spherical.phi = Math.max(0.18, Math.min(1.32, s.spherical.phi + dy * 8e-3));
+              s.spherical.phi = Math.max(MIN_VIEW_PHI, Math.min(MAX_VIEW_PHI, s.spherical.phi + dy * 8e-3));
               s.lastMouse = { x: e.clientX, y: e.clientY };
               updateCam();
             } else if (s.dragStart) {
@@ -1225,7 +1241,7 @@
             s.dragStart = null;
           };
           const onWheel = (e) => {
-            s.spherical.radius = Math.max(6.2, Math.min(22, s.spherical.radius + e.deltaY * 0.012));
+            s.spherical.radius = Math.max(MIN_VIEW_RADIUS, Math.min(MAX_VIEW_RADIUS, s.spherical.radius + e.deltaY * 0.012));
             updateCam();
           };
           renderer.domElement.addEventListener("mousedown", onDown);
@@ -1254,7 +1270,7 @@
               if (camFlat.lengthSq() > 1e-8) camFlat.normalize();
               const overhead = Math.max(0, Math.min(1, (1.46 - phi) / 1.22));
               s.coordLabels.forEach((mesh) => {
-                var _a;
+                var _a, _b, _c;
                 const mat = mesh.material;
                 if (!mat) return;
                 camToLabel.copy(camera.position).sub(mesh.position).normalize();
@@ -1262,8 +1278,9 @@
                 const edgeNormal = (_a = mesh.userData) == null ? void 0 : _a.edgeNormal;
                 const sideFacing = edgeNormal ? Math.max(0, camFlat.dot(edgeNormal) * 0.5 + 0.5) : 0.5;
                 const visibility = Math.max(0.05, Math.min(1, topFacing * 0.6 + sideFacing * 0.5));
-                mat.opacity = 0.18 + visibility * 0.74;
-                mat.emissiveIntensity = 0.03 + visibility * (0.28 + 0.22 * overhead);
+                const glowBoost = Math.max(0.9, (_c = (_b = mesh.userData) == null ? void 0 : _b.glowBoost) != null ? _c : 1);
+                mat.opacity = Math.min(1, (0.46 + visibility * 0.54) * (0.92 + glowBoost * 0.08));
+                mat.emissiveIntensity = (0.26 + visibility * (0.52 + 0.28 * overhead)) * glowBoost;
               });
             }
             const pulse = performance.now() * 15e-4;
@@ -1709,8 +1726,8 @@
             terminateStockfish();
           }
           s.spherical.theta = playerColor === W ? 0 : Math.PI;
-          s.spherical.phi = 0.85;
-          s.spherical.radius = 14;
+          s.spherical.phi = DEFAULT_VIEW_PHI;
+          s.spherical.radius = DEFAULT_VIEW_RADIUS;
           if (s.updateCam) s.updateCam();
           syncBoard();
           syncHighlights();
