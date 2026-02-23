@@ -5,12 +5,12 @@ const { useState, useEffect, useRef, useCallback } = React;
 
 function Chess3D() {
   const mountRef = useRef(null);
-  const DEFAULT_VIEW_PHI = 0.78;
-  const DEFAULT_VIEW_RADIUS = 14;
-  const MIN_VIEW_RADIUS = 7.6;
+  const DEFAULT_VIEW_PHI = 0.74;
+  const DEFAULT_VIEW_RADIUS = 15;
+  const MIN_VIEW_RADIUS = 8.8;
   const MAX_VIEW_RADIUS = 22;
   const MIN_VIEW_PHI = 0.18;
-  const MAX_VIEW_PHI = 1.1;
+  const MAX_VIEW_PHI = 0.98;
   const sr = useRef({
     board: mkBoard(),
     turn: W,
@@ -1256,166 +1256,77 @@ function Chess3D() {
       }
     }
 
-    // ── Coordinate labels — etched into the wood border rim ─────────────────
+    // ── Coordinate labels — floating outside board edges (all 4 sides) ─────
+    // Sprites always face camera, so labels remain readable as you orbit.
     const labelTexCache = new Map();
-    const makeEtchedLabelSet = (text, sz = 256) => {
-      const makeCanvas = () => {
-        const cv = document.createElement("canvas");
-        cv.width = cv.height = sz;
-        return cv;
-      };
+    const makeEdgeLabelTexture = (text, sz = 128) => {
+      const cv = document.createElement("canvas");
+      cv.width = cv.height = sz;
+      const cx = cv.getContext("2d");
 
-      const drawGlyph = (ctx, color, ox = 0, oy = 0, blur = 0) => {
-        ctx.save();
-        ctx.font = "bold " + Math.floor(sz * 0.64) + "px Palatino Linotype, Palatino, serif";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.shadowColor = color;
-        ctx.shadowBlur = blur;
-        ctx.fillStyle = color;
-        ctx.fillText(text, sz / 2 + ox, sz / 2 + oy);
-        ctx.restore();
-      };
+      cx.clearRect(0, 0, sz, sz);
+      cx.shadowColor = "rgba(0,0,0,0.95)";
+      cx.shadowBlur = 14;
+      cx.fillStyle = "#f2d498";
+      cx.font = `bold ${Math.floor(sz * 0.68)}px Palatino Linotype, Palatino, serif`;
+      cx.textAlign = "center";
+      cx.textBaseline = "middle";
+      cx.fillText(text, sz / 2, sz / 2);
 
-      // Diffuse/colour texture with engraved shading + micro grain.
-      const diffuseCv = makeCanvas();
-      const d = diffuseCv.getContext("2d");
-      d.clearRect(0, 0, sz, sz);
-      drawGlyph(d, "rgba(18,8,2,0.82)", 1.4, 1.4, 1.5);
-      drawGlyph(d, "rgba(255,224,172,0.18)", -0.8, -0.8, 0);
-      drawGlyph(d, "rgba(45,20,6,0.92)", 0, 0, 0);
-
-      d.save();
-      d.globalCompositeOperation = "source-atop";
-      for (let i = 0; i < 220; i++) {
-        const alpha = 0.05 + Math.random() * 0.08;
-        d.fillStyle = Math.random() > 0.5
-          ? "rgba(" +
-            (40 + Math.floor(Math.random() * 20)) + "," +
-            (18 + Math.floor(Math.random() * 12)) + "," +
-            (6 + Math.floor(Math.random() * 6)) + "," +
-            alpha + ")"
-          : "rgba(" +
-            (78 + Math.floor(Math.random() * 30)) + "," +
-            (40 + Math.floor(Math.random() * 18)) + "," +
-            (18 + Math.floor(Math.random() * 8)) + "," +
-            alpha + ")";
-        const dot = 0.8 + Math.random() * 2.0;
-        d.fillRect(Math.random() * sz, Math.random() * sz, dot, dot);
-      }
-      d.restore();
-
-      // Alpha mask to keep only glyph pixels.
-      const alphaCv = makeCanvas();
-      const a = alphaCv.getContext("2d");
-      a.clearRect(0, 0, sz, sz);
-      drawGlyph(a, "rgba(255,255,255,0.98)", 0, 0, 0.8);
-
-      // Emissive mask for glow pulse.
-      const glowCv = makeCanvas();
-      const g = glowCv.getContext("2d");
-      g.clearRect(0, 0, sz, sz);
-      drawGlyph(g, "rgba(255,220,150,0.86)", 0, 0, sz * 0.085);
-      drawGlyph(g, "rgba(255,220,150,0.54)", 0, 0, sz * 0.16);
-
-      // Bump mask to fake a shallow engraved groove.
-      const bumpCv = makeCanvas();
-      const b = bumpCv.getContext("2d");
-      b.fillStyle = "rgb(128,128,128)";
-      b.fillRect(0, 0, sz, sz);
-      drawGlyph(b, "rgba(210,210,210,0.90)", 0.8, 0.8, 0.8);
-      drawGlyph(b, "rgba(90,90,90,0.75)", -0.8, -0.8, 0.8);
-
-      const makeTex = (cv) => {
-        const tex = new THREE.CanvasTexture(cv);
-        tex.needsUpdate = true;
-        return tex;
-      };
-
-      return {
-        map: makeTex(diffuseCv),
-        alphaMap: makeTex(alphaCv),
-        emissiveMap: makeTex(glowCv),
-        bumpMap: makeTex(bumpCv),
-      };
+      const tex = new THREE.CanvasTexture(cv);
+      tex.needsUpdate = true;
+      return tex;
     };
 
-    const getEtchedLabelSet = (text) => {
+    const getEdgeLabelTexture = (text) => {
       if (!labelTexCache.has(text)) {
-        labelTexCache.set(text, makeEtchedLabelSet(text));
+        labelTexCache.set(text, makeEdgeLabelTexture(text));
       }
       return labelTexCache.get(text);
     };
 
-    const LABEL_Y = 0.014;
-    const FILE_LABEL_NEAR_Z = -4.28;
-    const FILE_LABEL_FAR_Z = 4.30;
-    const RANK_LABEL_X = 4.28;
-    const SIDE_FILE_LABEL_X = 4.31;
-    const LABEL_W = 0.78;
-    const LABEL_H = 0.38;
+    const LABEL_Y = 0.28;
+    const LABEL_DIST = 4.9;
+    const LABEL_SIZE = 0.64;
 
     s.coordLabels = [];
-    const coordGeo = new THREE.PlaneGeometry(LABEL_W, LABEL_H);
 
-    const addCoordLabel = (text, x, z, rotY, edgeNormal, scale = 1, glowBoost = 1) => {
-      const texSet = getEtchedLabelSet(text);
-      const mat = new THREE.MeshStandardMaterial({
-        map: texSet.map,
-        alphaMap: texSet.alphaMap,
-        emissiveMap: texSet.emissiveMap,
-        bumpMap: texSet.bumpMap,
-        bumpScale: -0.03,
-        transparent: true,
-        alphaTest: 0.02,
-        depthWrite: false,
-        polygonOffset: true,
-        polygonOffsetFactor: -1,
-        polygonOffsetUnits: -2,
-        color: 0xffffff,
-        roughness: 0.56,
-        metalness: 0.02,
-        emissive: new THREE.Color(0xffe1ad),
-        emissiveIntensity: 0.28 * glowBoost,
-        side: THREE.DoubleSide,
-      });
-
-      const mesh = new THREE.Mesh(coordGeo, mat);
-      mesh.rotation.set(-Math.PI / 2, rotY, 0);
-      mesh.position.set(x, LABEL_Y, z);
-      mesh.scale.set(scale, scale, 1);
-      mesh.receiveShadow = true;
-      mesh.userData.edgeNormal = edgeNormal.clone();
-      mesh.userData.glowBoost = glowBoost;
-      scene.add(mesh);
-      s.coordLabels.push(mesh);
+    const addEdgeLabel = (text, x, z, scale = 1) => {
+      const sprite = new THREE.Sprite(
+        new THREE.SpriteMaterial({
+          map: getEdgeLabelTexture(text),
+          transparent: true,
+          depthWrite: false,
+          sizeAttenuation: true,
+          opacity: 0.96,
+        })
+      );
+      sprite.scale.set(LABEL_SIZE * scale, LABEL_SIZE * scale, 1);
+      sprite.position.set(x, LABEL_Y, z);
+      scene.add(sprite);
+      s.coordLabels.push(sprite);
     };
 
     const files = "abcdefgh".split("");
     const ranks = "87654321".split("");
 
+    // File letters on near and far edges.
     files.forEach((letter, i) => {
       const wx = i - 3.5;
-      addCoordLabel(letter, wx, FILE_LABEL_FAR_Z, Math.PI, new THREE.Vector3(0, 0, 1), 1.14, 1.20);
-      addCoordLabel(letter, wx, FILE_LABEL_NEAR_Z, 0, new THREE.Vector3(0, 0, -1), 1.08, 1.12);
+      addEdgeLabel(letter, wx, LABEL_DIST, 1);
+      addEdgeLabel(letter, wx, -LABEL_DIST, 1);
     });
 
+    // Rank numbers on left and right edges.
     ranks.forEach((rank, i) => {
       const wz = i - 3.5;
-      addCoordLabel(rank, RANK_LABEL_X, wz, -Math.PI / 2, new THREE.Vector3(1, 0, 0), 1.08, 1.08);
-      addCoordLabel(rank, -RANK_LABEL_X, wz, Math.PI / 2, new THREE.Vector3(-1, 0, 0), 1.08, 1.08);
-    });
-
-    // Extra file letters on left/right so all board edges carry file coordinates.
-    files.forEach((letter, i) => {
-      const wz = i - 3.5;
-      addCoordLabel(letter, SIDE_FILE_LABEL_X, wz, -Math.PI / 2, new THREE.Vector3(1, 0, 0), 0.92, 1.15);
-      addCoordLabel(letter, -SIDE_FILE_LABEL_X, wz, Math.PI / 2, new THREE.Vector3(-1, 0, 0), 0.92, 1.15);
+      addEdgeLabel(rank, LABEL_DIST, wz, 1);
+      addEdgeLabel(rank, -LABEL_DIST, wz, 1);
     });
 
     // Camera update
-    const CAMERA_TARGET_Y = -0.42;
-    const CAMERA_LIFT_Y = 1.62;
+    const CAMERA_TARGET_Y = -0.95;
+    const CAMERA_LIFT_Y = 1.48;
     const updateCam = () => {
       const { theta, phi, radius } = s.spherical;
       camera.position.set(
@@ -1466,9 +1377,7 @@ function Chess3D() {
     renderer.domElement.addEventListener("mouseup", onUp);
     renderer.domElement.addEventListener("wheel", onWheel, { passive: true });
     renderer.domElement.addEventListener("contextmenu", e => e.preventDefault());
-    // Render loop — fade piece-symbol sprites + visibility glow for etched coordinates
-    const camToLabel = new THREE.Vector3();
-    const camFlat = new THREE.Vector3();
+    // Render loop — fade piece-symbol sprites and edge coordinate labels
 
     const animate = () => {
       s.animId = requestAnimationFrame(animate);
@@ -1487,30 +1396,11 @@ function Chess3D() {
         });
       }
 
-      // Etched coordinates pulse based on practical visibility:
-      // more glow on the side facing camera, less on far/oblique sides.
+      // Floating edge labels fade gently as camera goes low to reduce clutter.
       if (s.coordLabels.length > 0) {
-        camFlat.set(camera.position.x, 0, camera.position.z);
-        if (camFlat.lengthSq() > 1e-8) camFlat.normalize();
-
-        // Extra boost when camera is not too shallow.
-        const overhead = Math.max(0, Math.min(1, (1.46 - phi) / 1.22));
-
-        s.coordLabels.forEach((mesh) => {
-          const mat = mesh.material;
-          if (!mat) return;
-
-          camToLabel.copy(camera.position).sub(mesh.position).normalize();
-          const topFacing = Math.max(0.08, camToLabel.y);
-          const edgeNormal = mesh.userData?.edgeNormal;
-          const sideFacing = edgeNormal
-            ? Math.max(0, camFlat.dot(edgeNormal) * 0.5 + 0.5)
-            : 0.5;
-
-          const visibility = Math.max(0.05, Math.min(1, topFacing * 0.6 + sideFacing * 0.5));
-          const glowBoost = Math.max(0.9, mesh.userData?.glowBoost ?? 1);
-          mat.opacity = Math.min(1, (0.46 + visibility * 0.54) * (0.92 + glowBoost * 0.08));
-          mat.emissiveIntensity = (0.26 + visibility * (0.52 + 0.28 * overhead)) * glowBoost;
+        const coordOpacity = Math.max(0.3, Math.min(1, 1.14 - phi * 0.42));
+        s.coordLabels.forEach((sprite) => {
+          if (sprite.material) sprite.material.opacity = coordOpacity;
         });
       }
 
