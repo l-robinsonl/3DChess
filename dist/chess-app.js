@@ -90,6 +90,7 @@
           aiLevelId: "pathetic",
           openingWhite: "Start Position",
           openingBlack: "Awaiting White move",
+          moveHistory: [],
           drawReason: null,
           promotion: null
         });
@@ -143,6 +144,7 @@
             aiLevelId: s.aiLevelId,
             openingWhite: s.openingWhite,
             openingBlack: s.openingBlack,
+            moveHistory: [...s.moveHistory],
             drawReason: s.drawReason || null,
             promotion: s.pendingPromotion ? {
               color: s.pendingPromotion.color,
@@ -1787,6 +1789,63 @@
         const currentAiPreset = resolveAiPreset(ui.aiPreset);
         const currentAiLevel = resolveAiLevel(ui.aiLevelId);
         const aiSummary = ui.aiMode === AI_MODE_RANDOM ? "Pathetic" : currentAiLevel.label + " \xB7 " + currentAiPreset.label + " \xB7 depth " + ui.aiDepth;
+        const formatMoveNotation = (uci) => {
+          const text = String(uci != null ? uci : "").trim().toLowerCase();
+          if (!/^[a-h][1-8][a-h][1-8][nbrq]?$/.test(text)) return text || "-";
+          const from = text.slice(0, 2);
+          const to = text.slice(2, 4);
+          if ((from === "e1" || from === "e8") && (to === "g1" || to === "g8")) return "O-O";
+          if ((from === "e1" || from === "e8") && (to === "c1" || to === "c8")) return "O-O-O";
+          const promo = text[4] ? "=" + text[4].toUpperCase() : "";
+          return from + "-" + to + promo;
+        };
+        const notationRows = [];
+        for (let i = 0; i < (ui.moveHistory || []).length; i += 2) {
+          notationRows.push({
+            ply: Math.floor(i / 2) + 1,
+            white: formatMoveNotation(ui.moveHistory[i]),
+            black: formatMoveNotation(ui.moveHistory[i + 1])
+          });
+        }
+        const perspectiveColor = ui.mode === "net" || ui.mode === "pvai" ? ui.playerColor : null;
+        const perspectiveTurn = perspectiveColor ? ui.turn === perspectiveColor : null;
+        let turnHeadline = statusMsg();
+        let turnSubline = "";
+        let turnTone = isOver ? "over" : ui.status === "check" ? "warn" : "neutral";
+        if (!isOver && (ui.status === "playing" || ui.status === "check")) {
+          if (ui.mode === "net") {
+            if (perspectiveTurn) {
+              turnHeadline = "Your Move";
+              turnSubline = "You are " + (ui.playerColor === W ? "White" : "Black");
+              turnTone = ui.status === "check" ? "warn" : "ready";
+            } else {
+              turnHeadline = "Opponent's Move";
+              turnSubline = "You are " + (ui.playerColor === W ? "White" : "Black");
+              turnTone = ui.status === "check" ? "warn" : "neutral";
+            }
+          } else if (ui.mode === "pvai") {
+            if (perspectiveTurn) {
+              turnHeadline = "Your Move";
+              turnSubline = "Playing as " + (ui.playerColor === W ? "White" : "Black");
+              turnTone = ui.status === "check" ? "warn" : "ready";
+            } else {
+              turnHeadline = "AI Move";
+              turnSubline = "Playing as " + (ui.playerColor === W ? "White" : "Black");
+              turnTone = ui.status === "check" ? "warn" : "neutral";
+            }
+          } else if (ui.mode === "pvp") {
+            turnHeadline = turnLabel + " to Move";
+            turnSubline = "Local game";
+            turnTone = ui.status === "check" ? "warn" : "neutral";
+          }
+          if (ui.status === "check") {
+            if (perspectiveColor) {
+              turnSubline = ui.turn === perspectiveColor ? "You are in check" : "Opponent is in check";
+            } else {
+              turnSubline = turnLabel + " is in check";
+            }
+          }
+        }
         const btn = (label, onClick, color = "#8b6914", extra = {}) => /* @__PURE__ */ React.createElement(
           "button",
           {
@@ -1894,77 +1953,72 @@
         @keyframes pulse { 0%,100%{opacity:0.2} 50%{opacity:1} }
         @keyframes spin { to { transform: rotate(360deg); } }
       `), /* @__PURE__ */ React.createElement("div", { style: {
-          padding: "10px 20px",
+          padding: "8px 16px",
           background: "rgba(0,0,0,0.55)",
           backdropFilter: "blur(8px)",
           borderBottom: "1px solid #2a1f0a",
           display: "flex",
           alignItems: "center",
-          gap: "16px",
-          flexWrap: "wrap",
+          gap: "12px",
           zIndex: 10,
           flexShrink: 0
-        } }, /* @__PURE__ */ React.createElement("span", { style: { fontSize: "1.5em", color: "#d4a843", fontWeight: "bold", letterSpacing: "0.06em" } }, "\u265F 3D CHESS"), ui.mode && /* @__PURE__ */ React.createElement("div", { style: {
-          padding: "5px 14px",
-          borderRadius: "20px",
-          fontSize: "0.88em",
-          background: isOver ? "#5c1010" : ui.status === "check" ? "#6b3a00" : "rgba(255,255,255,0.08)",
-          color: isOver ? "#ff8888" : ui.status === "check" ? "#ffcc44" : "#d4c5a9",
-          border: `1px solid ${isOver ? "#aa3333" : ui.status === "check" ? "#cc8800" : "#3a2f1a"}`,
-          fontWeight: "bold"
-        } }, statusMsg()), ui.mode === "pvai" && ui.aiThinking && /* @__PURE__ */ React.createElement("div", { style: {
-          display: "flex",
-          alignItems: "center",
-          gap: "8px",
-          padding: "5px 14px",
-          borderRadius: "20px",
-          background: "rgba(80,60,20,0.4)",
-          border: "1px solid #6b4f10",
-          color: "#c8a040",
-          fontSize: "0.84em",
-          fontStyle: "italic"
-        } }, /* @__PURE__ */ React.createElement("span", { style: { animation: "pulse 1s ease-in-out infinite" } }, "\u25CF"), "AI is thinking\u2026"), ui.mode === "pvai" && /* @__PURE__ */ React.createElement("div", { style: {
-          padding: "5px 12px",
-          borderRadius: "20px",
-          fontSize: "0.8em",
-          background: "rgba(30,50,90,0.35)",
-          border: "1px solid #355a95",
-          color: "#9bc2ff"
-        } }, "AI: ", aiSummary), ui.mode && /* @__PURE__ */ React.createElement("div", { style: {
-          display: "flex",
-          alignItems: "center",
-          gap: "10px",
-          flexWrap: "wrap",
-          padding: "5px 12px",
-          borderRadius: "10px",
-          background: "rgba(255,255,255,0.04)",
+        } }, /* @__PURE__ */ React.createElement("span", { style: { fontSize: "1.35em", color: "#d4a843", fontWeight: "bold", letterSpacing: "0.06em" } }, "\u265F 3D CHESS"), ui.mode && /* @__PURE__ */ React.createElement("div", { style: {
+          padding: "4px 10px",
+          borderRadius: "999px",
           border: "1px solid #3a2f1a",
-          color: "#c9b38b",
-          fontSize: "0.76em"
-        } }, /* @__PURE__ */ React.createElement("span", null, "White opening: ", ui.openingWhite), /* @__PURE__ */ React.createElement("span", null, "Black defense: ", ui.openingBlack)), ui.mode === "net" && /* @__PURE__ */ React.createElement("div", { style: {
+          color: "#b9a27a",
+          fontSize: "0.78em",
+          letterSpacing: "0.04em",
+          background: "rgba(255,255,255,0.05)"
+        } }, ui.mode === "net" ? "ONLINE" : ui.mode === "pvai" ? "VS AI" : "LOCAL PVP"), /* @__PURE__ */ React.createElement("span", { style: { marginLeft: "auto", color: "#5d4f3a", fontSize: "0.74em" } }, "Right-click drag to orbit \xB7 Scroll to zoom")), /* @__PURE__ */ React.createElement("div", { style: { flex: 1, minHeight: 0, width: "100%", display: "flex" } }, /* @__PURE__ */ React.createElement("div", { ref: mountRef, style: { flex: 1, minWidth: 0, position: "relative" } }), ui.mode && /* @__PURE__ */ React.createElement("aside", { style: {
+          width: "360px",
+          maxWidth: "42vw",
+          minWidth: "280px",
+          borderLeft: "1px solid #2a1f0a",
+          background: "linear-gradient(180deg, rgba(12,16,24,0.97), rgba(10,12,18,0.97))",
+          padding: "12px",
           display: "flex",
-          alignItems: "center",
-          gap: "8px",
-          padding: "5px 14px",
-          borderRadius: "20px",
-          background: net.peerStatus === "connected" ? "rgba(20,60,20,0.5)" : "rgba(80,20,20,0.5)",
-          border: `1px solid ${net.peerStatus === "connected" ? "#2a6a2a" : "#6a2a2a"}`,
-          color: net.peerStatus === "connected" ? "#88cc88" : "#cc8888",
-          fontSize: "0.82em"
-        } }, /* @__PURE__ */ React.createElement("span", { style: { fontSize: "0.6em", animation: net.peerStatus === "connected" ? "" : "pulse 1.5s ease-in-out infinite" } }, "\u25CF"), net.peerStatus === "connected" ? `Online \xB7 Playing as ${ui.playerColor === W ? "White" : "Black"}` : "Disconnected"), ui.mode && hasClock && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: "8px" } }, [W, B].map((color) => {
+          flexDirection: "column",
+          gap: "10px",
+          minHeight: 0
+        } }, /* @__PURE__ */ React.createElement("div", { style: {
+          border: turnTone === "over" ? "1px solid #8c2a2a" : turnTone === "warn" ? "1px solid #b4791c" : turnTone === "ready" ? "1px solid #2f7f4f" : "1px solid #355a95",
+          background: turnTone === "over" ? "rgba(90,18,18,0.55)" : turnTone === "warn" ? "rgba(88,52,10,0.55)" : turnTone === "ready" ? "rgba(18,62,36,0.55)" : "rgba(23,36,62,0.55)",
+          borderRadius: "12px",
+          padding: "12px 14px"
+        } }, /* @__PURE__ */ React.createElement("div", { style: {
+          fontSize: "1.12em",
+          fontWeight: "bold",
+          color: turnTone === "over" ? "#ff9d9d" : turnTone === "warn" ? "#ffd277" : "#f0d9b5",
+          marginBottom: "4px"
+        } }, turnHeadline), turnSubline && /* @__PURE__ */ React.createElement("div", { style: { color: "#bda883", fontSize: "0.82em", letterSpacing: "0.02em" } }, turnSubline)), ui.mode === "net" && /* @__PURE__ */ React.createElement("div", { style: {
+          border: "1px solid " + (net.peerStatus === "connected" ? "#2a6a2a" : "#6a2a2a"),
+          background: net.peerStatus === "connected" ? "rgba(18,58,26,0.45)" : "rgba(68,22,22,0.42)",
+          borderRadius: "10px",
+          padding: "10px 12px"
+        } }, /* @__PURE__ */ React.createElement("div", { style: {
+          color: net.peerStatus === "connected" ? "#9ce09c" : "#f2a1a1",
+          fontSize: "0.82em",
+          fontWeight: "bold",
+          letterSpacing: "0.04em"
+        } }, net.peerStatus === "connected" ? "CONNECTED" : "DISCONNECTED"), /* @__PURE__ */ React.createElement("div", { style: { color: "#bda883", fontSize: "0.77em", marginTop: "4px" } }, net.statusMsg || "")), hasClock && /* @__PURE__ */ React.createElement("div", { style: {
+          border: "1px solid #3a2f1a",
+          background: "rgba(255,255,255,0.04)",
+          borderRadius: "10px",
+          padding: "10px 12px"
+        } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.7em", letterSpacing: "0.06em", marginBottom: "8px" } }, "CLOCK \xB7 ", activeTimeControl.label), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" } }, [W, B].map((color) => {
           var _a;
           return /* @__PURE__ */ React.createElement(
             "div",
             {
               key: color,
               style: {
-                padding: "5px 10px",
+                padding: "8px 10px",
                 borderRadius: "8px",
                 fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-                fontSize: "0.82em",
-                minWidth: "88px",
-                border: `1px solid ${ui.turn === color && !isOver ? "#b68c2c" : "#3a2f1a"}`,
-                background: ui.turn === color && !isOver ? "rgba(122,86,24,0.35)" : "rgba(255,255,255,0.06)",
+                fontSize: "0.95em",
+                border: "1px solid " + (ui.turn === color && !isOver ? "#b68c2c" : "#3a2f1a"),
+                background: ui.turn === color && !isOver ? "rgba(122,86,24,0.35)" : "rgba(255,255,255,0.05)",
                 color: color === W ? "#f5e8cc" : "#d4c5a9"
               }
             },
@@ -1972,7 +2026,53 @@
             " ",
             formatClock((_a = ui.clockMs) == null ? void 0 : _a[color])
           );
-        }), /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.74em", letterSpacing: "0.03em" } }, activeTimeControl.label)), /* @__PURE__ */ React.createElement("span", { style: { color: "#4a3f2f", fontSize: "0.78em", marginLeft: "4px" } }, "Right-click drag = orbit \xA0\xB7\xA0 Scroll = zoom"), /* @__PURE__ */ React.createElement("div", { style: { marginLeft: "auto", display: "flex", gap: "10px" } }, ui.mode && !isOver && btn("\u{1F3F3} Resign", () => resignGame(), "#6a1f1f"), ui.mode && btn("\u27F5 Menu", () => {
+        }))), ui.mode === "pvai" && /* @__PURE__ */ React.createElement("div", { style: {
+          border: "1px solid #355a95",
+          background: "rgba(30,50,90,0.26)",
+          borderRadius: "10px",
+          padding: "10px 12px"
+        } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#9bc2ff", fontSize: "0.74em", letterSpacing: "0.05em", marginBottom: "4px" } }, "AI SETTINGS"), /* @__PURE__ */ React.createElement("div", { style: { color: "#c9ddff", fontSize: "0.83em" } }, aiSummary), ui.aiThinking && /* @__PURE__ */ React.createElement("div", { style: { color: "#a9c7ff", fontSize: "0.76em", marginTop: "6px" } }, "AI is thinking...")), /* @__PURE__ */ React.createElement("div", { style: {
+          border: "1px solid #3a2f1a",
+          background: "rgba(255,255,255,0.04)",
+          borderRadius: "10px",
+          padding: "10px 12px"
+        } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.7em", letterSpacing: "0.06em", marginBottom: "6px" } }, "OPENING"), /* @__PURE__ */ React.createElement("div", { style: { color: "#d4c5a9", fontSize: "0.8em", lineHeight: 1.4 } }, /* @__PURE__ */ React.createElement("div", null, "White: ", ui.openingWhite), /* @__PURE__ */ React.createElement("div", null, "Black: ", ui.openingBlack))), /* @__PURE__ */ React.createElement("div", { style: {
+          border: "1px solid #3a2f1a",
+          background: "rgba(255,255,255,0.04)",
+          borderRadius: "10px",
+          padding: "10px 12px",
+          display: "flex",
+          flexDirection: "column",
+          minHeight: 0,
+          flex: 1
+        } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58", fontSize: "0.7em", letterSpacing: "0.06em", marginBottom: "8px" } }, "MOVE LIST (NOTATION)"), /* @__PURE__ */ React.createElement("div", { style: {
+          display: "grid",
+          gridTemplateColumns: "44px 1fr 1fr",
+          gap: "6px",
+          color: "#7e704f",
+          fontSize: "0.7em",
+          letterSpacing: "0.04em",
+          marginBottom: "6px",
+          paddingRight: "4px"
+        } }, /* @__PURE__ */ React.createElement("div", null, "#"), /* @__PURE__ */ React.createElement("div", null, "WHITE"), /* @__PURE__ */ React.createElement("div", null, "BLACK")), /* @__PURE__ */ React.createElement("div", { style: { overflowY: "auto", minHeight: 0, paddingRight: "4px" } }, notationRows.length === 0 ? /* @__PURE__ */ React.createElement("div", { style: { color: "#6a5a3a", fontSize: "0.8em", padding: "6px 0" } }, "Moves will appear here once the game starts.") : notationRows.map((row, idx) => /* @__PURE__ */ React.createElement(
+          "div",
+          {
+            key: row.ply,
+            style: {
+              display: "grid",
+              gridTemplateColumns: "44px 1fr 1fr",
+              gap: "6px",
+              alignItems: "center",
+              padding: "6px 0",
+              borderTop: idx === 0 ? "none" : "1px solid rgba(255,255,255,0.05)",
+              fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+              fontSize: "0.82em"
+            }
+          },
+          /* @__PURE__ */ React.createElement("div", { style: { color: "#8a7a58" } }, row.ply, "."),
+          /* @__PURE__ */ React.createElement("div", { style: { color: "#f0d9b5" } }, row.white || "-"),
+          /* @__PURE__ */ React.createElement("div", { style: { color: "#d4c5a9" } }, row.black || "")
+        )))), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: "8px", gridTemplateColumns: "1fr 1fr", flexShrink: 0 } }, ui.mode && !isOver && btn("\u{1F3F3} Resign", () => resignGame(), "#6a1f1f", { width: "100%" }), ui.mode && ui.mode !== "net" && btn("\u21BA Restart", () => startGame(ui.mode, ui.playerColor, ui.timeControlId), "#1a2a1a", { width: "100%" }), ui.mode && btn("\u27F5 Menu", () => {
           disconnectNet();
           setPresenceStatus("lobby");
           const s = sr.current;
@@ -1980,7 +2080,10 @@
           s.status = "idle";
           setNet((v) => ({ ...v, screen: null, peerStatus: "", incomingChallenge: null, outgoingChallenge: null }));
           setUi((v) => ({ ...v, mode: null, status: "idle" }));
-        }, "#2a2010"), ui.mode && ui.mode !== "net" && btn("\u21BA Restart", () => startGame(ui.mode, ui.playerColor, ui.timeControlId), "#1a2a1a"))), /* @__PURE__ */ React.createElement("div", { ref: mountRef, style: { flex: 1, width: "100%", position: "relative" } }), ui.mode && ui.promotion && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: { ...cardStyle, minWidth: "420px", maxWidth: "460px" } }, /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 10px", color: "#d4a843", fontSize: "1.55em" } }, "Choose Promotion"), /* @__PURE__ */ React.createElement("p", { style: { color: "#7d6e4f", margin: "0 0 16px", fontSize: "0.82em" } }, "Select the piece your pawn becomes."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(2, minmax(140px, 1fr))", gap: "10px" } }, promotionOptions.map((opt) => /* @__PURE__ */ React.createElement(
+        }, "#2a2010", {
+          width: "100%",
+          gridColumn: "1 / -1"
+        })))), ui.mode && ui.promotion && /* @__PURE__ */ React.createElement("div", { style: overlayStyle }, /* @__PURE__ */ React.createElement("div", { style: { ...cardStyle, minWidth: "420px", maxWidth: "460px" } }, /* @__PURE__ */ React.createElement("h2", { style: { margin: "0 0 10px", color: "#d4a843", fontSize: "1.55em" } }, "Choose Promotion"), /* @__PURE__ */ React.createElement("p", { style: { color: "#7d6e4f", margin: "0 0 16px", fontSize: "0.82em" } }, "Select the piece your pawn becomes."), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(2, minmax(140px, 1fr))", gap: "10px" } }, promotionOptions.map((opt) => /* @__PURE__ */ React.createElement(
           "button",
           {
             key: opt.type,
