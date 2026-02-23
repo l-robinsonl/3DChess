@@ -242,6 +242,16 @@ const OPENING_LINE_BOOK = [
     white: "Queen's Pawn with c4",
     black: "King's Indian / Grunfeld Setup",
   },
+  {
+    seq: ["e2e3", "d7d5", "d2d3"],
+    white: "Cow Opening (Anna Cramling)",
+    black: "d5 Setup vs Cow",
+  },
+  {
+    seq: ["e2e3", "d7d5", "d2d3", "e7e5", "g1e2", "f8d6", "e2g3", "g8f6", "b1d2"],
+    white: "Cow Opening (Anna Cramling)",
+    black: "Classical Setup vs Cow",
+  },
 ];
 
 function describeOpening(moveHistory) {

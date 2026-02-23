@@ -41,6 +41,7 @@
           aiTimerId: null,
           pieceMeshes: /* @__PURE__ */ new Map(),
           labelSprites: /* @__PURE__ */ new Map(),
+          coordLabels: [],
           highlights: [],
           graveyardMeshes: [],
           captured: { [W]: [], [B]: [] },
@@ -830,6 +831,58 @@
           const cool = new THREE.PointLight(4482764, 0.3, 16);
           cool.position.set(5, 1.5, -4);
           scene.add(cool);
+          const darkSideBack = new THREE.PointLight(16766624, 1.25, 42, 2);
+          darkSideBack.position.set(0, 5.8, -12.4);
+          scene.add(darkSideBack);
+          const darkSideFill = new THREE.DirectionalLight(16770239, 0.52);
+          darkSideFill.position.set(0, 7, -13.8);
+          darkSideFill.target.position.set(0, 0.35, -2.4);
+          scene.add(darkSideFill);
+          scene.add(darkSideFill.target);
+          const makeSunStarTex = (sz = 512) => {
+            const cv = document.createElement("canvas");
+            cv.width = cv.height = sz;
+            const cx = cv.getContext("2d");
+            const c = sz * 0.5;
+            cx.clearRect(0, 0, sz, sz);
+            const halo = cx.createRadialGradient(c, c, sz * 0.04, c, c, sz * 0.5);
+            halo.addColorStop(0, "rgba(255,245,215,0.95)");
+            halo.addColorStop(0.24, "rgba(255,210,130,0.60)");
+            halo.addColorStop(0.6, "rgba(255,165,80,0.22)");
+            halo.addColorStop(1, "rgba(255,120,40,0)");
+            cx.fillStyle = halo;
+            cx.fillRect(0, 0, sz, sz);
+            cx.translate(c, c);
+            for (let i = 0; i < 16; i++) {
+              cx.rotate(Math.PI * 2 / 16);
+              const len = sz * (0.23 + Math.random() * 0.08);
+              const w = sz * (6e-3 + Math.random() * 6e-3);
+              cx.fillStyle = "rgba(255,228,170," + (0.16 + Math.random() * 0.12) + ")";
+              cx.fillRect(-w * 0.5, -len, w, len);
+            }
+            cx.setTransform(1, 0, 0, 1, 0, 0);
+            const core = cx.createRadialGradient(c, c, 0, c, c, sz * 0.16);
+            core.addColorStop(0, "rgba(255,252,240,1)");
+            core.addColorStop(0.55, "rgba(255,223,155,0.95)");
+            core.addColorStop(1, "rgba(255,200,120,0)");
+            cx.fillStyle = core;
+            cx.fillRect(0, 0, sz, sz);
+            const tex = new THREE.CanvasTexture(cv);
+            tex.needsUpdate = true;
+            return tex;
+          };
+          const darkSideSun = new THREE.Sprite(new THREE.SpriteMaterial({
+            map: makeSunStarTex(),
+            color: 16773842,
+            transparent: true,
+            opacity: 0.86,
+            depthWrite: false,
+            depthTest: true,
+            blending: THREE.AdditiveBlending
+          }));
+          darkSideSun.position.set(0, 6.6, -16.2);
+          darkSideSun.scale.set(6.4, 6.4, 1);
+          scene.add(darkSideSun);
           const makeSquareTex = (isLight, sz = 256) => {
             const cv = document.createElement("canvas");
             cv.width = cv.height = sz;
@@ -1015,60 +1068,129 @@
               s.squareMeshes[r][c] = mesh;
             }
           }
-          const makeLabel = (text, sz = 96) => {
-            const cv = document.createElement("canvas");
-            cv.width = cv.height = sz;
-            const cx = cv.getContext("2d");
-            cx.shadowColor = "rgba(0,0,0,0.9)";
-            cx.shadowBlur = 10;
-            cx.shadowOffsetX = 0;
-            cx.shadowOffsetY = 0;
-            cx.fillStyle = "#d4b87a";
-            cx.font = `bold ${sz * 0.68}px "Palatino Linotype", Palatino, serif`;
-            cx.textAlign = "center";
-            cx.textBaseline = "middle";
-            cx.fillText(text, sz / 2, sz / 2);
-            const tex = new THREE.CanvasTexture(cv);
-            tex.needsUpdate = true;
-            return tex;
+          const labelTexCache = /* @__PURE__ */ new Map();
+          const makeEtchedLabelSet = (text, sz = 256) => {
+            const makeCanvas = () => {
+              const cv = document.createElement("canvas");
+              cv.width = cv.height = sz;
+              return cv;
+            };
+            const drawGlyph = (ctx, color, ox = 0, oy = 0, blur = 0) => {
+              ctx.save();
+              ctx.font = "bold " + Math.floor(sz * 0.64) + "px Palatino Linotype, Palatino, serif";
+              ctx.textAlign = "center";
+              ctx.textBaseline = "middle";
+              ctx.shadowColor = color;
+              ctx.shadowBlur = blur;
+              ctx.fillStyle = color;
+              ctx.fillText(text, sz / 2 + ox, sz / 2 + oy);
+              ctx.restore();
+            };
+            const diffuseCv = makeCanvas();
+            const d = diffuseCv.getContext("2d");
+            d.clearRect(0, 0, sz, sz);
+            drawGlyph(d, "rgba(18,8,2,0.82)", 1.4, 1.4, 1.5);
+            drawGlyph(d, "rgba(255,224,172,0.18)", -0.8, -0.8, 0);
+            drawGlyph(d, "rgba(45,20,6,0.92)", 0, 0, 0);
+            d.save();
+            d.globalCompositeOperation = "source-atop";
+            for (let i = 0; i < 220; i++) {
+              const alpha = 0.05 + Math.random() * 0.08;
+              d.fillStyle = Math.random() > 0.5 ? "rgba(" + (40 + Math.floor(Math.random() * 20)) + "," + (18 + Math.floor(Math.random() * 12)) + "," + (6 + Math.floor(Math.random() * 6)) + "," + alpha + ")" : "rgba(" + (78 + Math.floor(Math.random() * 30)) + "," + (40 + Math.floor(Math.random() * 18)) + "," + (18 + Math.floor(Math.random() * 8)) + "," + alpha + ")";
+              const dot = 0.8 + Math.random() * 2;
+              d.fillRect(Math.random() * sz, Math.random() * sz, dot, dot);
+            }
+            d.restore();
+            const alphaCv = makeCanvas();
+            const a = alphaCv.getContext("2d");
+            a.clearRect(0, 0, sz, sz);
+            drawGlyph(a, "rgba(255,255,255,0.98)", 0, 0, 0.8);
+            const glowCv = makeCanvas();
+            const g = glowCv.getContext("2d");
+            g.clearRect(0, 0, sz, sz);
+            drawGlyph(g, "rgba(255,220,150,0.86)", 0, 0, sz * 0.085);
+            drawGlyph(g, "rgba(255,220,150,0.54)", 0, 0, sz * 0.16);
+            const bumpCv = makeCanvas();
+            const b = bumpCv.getContext("2d");
+            b.fillStyle = "rgb(128,128,128)";
+            b.fillRect(0, 0, sz, sz);
+            drawGlyph(b, "rgba(210,210,210,0.90)", 0.8, 0.8, 0.8);
+            drawGlyph(b, "rgba(90,90,90,0.75)", -0.8, -0.8, 0.8);
+            const makeTex = (cv) => {
+              const tex = new THREE.CanvasTexture(cv);
+              tex.needsUpdate = true;
+              return tex;
+            };
+            return {
+              map: makeTex(diffuseCv),
+              alphaMap: makeTex(alphaCv),
+              emissiveMap: makeTex(glowCv),
+              bumpMap: makeTex(bumpCv)
+            };
           };
-          const spriteMat = (tex) => new THREE.SpriteMaterial({
-            map: tex,
-            transparent: true,
-            depthWrite: false,
-            sizeAttenuation: true
-          });
-          const LABEL_Y = 0.22;
-          const LABEL_DIST = 4.82;
-          const LABEL_SIZE = 0.58;
+          const getEtchedLabelSet = (text) => {
+            if (!labelTexCache.has(text)) {
+              labelTexCache.set(text, makeEtchedLabelSet(text));
+            }
+            return labelTexCache.get(text);
+          };
+          const LABEL_Y = -15e-4;
+          const LABEL_DIST = 4.17;
+          const LABEL_W = 0.56;
+          const LABEL_H = 0.24;
+          s.coordLabels = [];
+          const coordGeo = new THREE.PlaneGeometry(LABEL_W, LABEL_H);
+          const addCoordLabel = (text, x, z, rotY, edgeNormal) => {
+            const texSet = getEtchedLabelSet(text);
+            const mat = new THREE.MeshStandardMaterial({
+              map: texSet.map,
+              alphaMap: texSet.alphaMap,
+              emissiveMap: texSet.emissiveMap,
+              bumpMap: texSet.bumpMap,
+              bumpScale: -0.03,
+              transparent: true,
+              alphaTest: 0.06,
+              depthWrite: false,
+              polygonOffset: true,
+              polygonOffsetFactor: -1,
+              polygonOffsetUnits: -2,
+              color: 16777215,
+              roughness: 0.72,
+              metalness: 0.02,
+              emissive: new THREE.Color(15909498),
+              emissiveIntensity: 0.12,
+              side: THREE.DoubleSide
+            });
+            const mesh = new THREE.Mesh(coordGeo, mat);
+            mesh.rotation.set(-Math.PI / 2, rotY, 0);
+            mesh.position.set(x, LABEL_Y, z);
+            mesh.receiveShadow = true;
+            mesh.userData.edgeNormal = edgeNormal.clone();
+            scene.add(mesh);
+            s.coordLabels.push(mesh);
+          };
           const files = "abcdefgh".split("");
           const ranks = "87654321".split("");
           files.forEach((letter, i) => {
             const wx = i - 3.5;
-            [LABEL_DIST, -LABEL_DIST].forEach((wz) => {
-              const sp = new THREE.Sprite(spriteMat(makeLabel(letter)));
-              sp.scale.set(LABEL_SIZE, LABEL_SIZE, 1);
-              sp.position.set(wx, LABEL_Y, wz);
-              scene.add(sp);
-            });
+            addCoordLabel(letter, wx, LABEL_DIST, Math.PI, new THREE.Vector3(0, 0, 1));
+            addCoordLabel(letter, wx, -LABEL_DIST, 0, new THREE.Vector3(0, 0, -1));
           });
           ranks.forEach((rank, i) => {
             const wz = i - 3.5;
-            [LABEL_DIST, -LABEL_DIST].forEach((wx) => {
-              const sp = new THREE.Sprite(spriteMat(makeLabel(rank)));
-              sp.scale.set(LABEL_SIZE, LABEL_SIZE, 1);
-              sp.position.set(wx, LABEL_Y, wz);
-              scene.add(sp);
-            });
+            addCoordLabel(rank, LABEL_DIST, wz, -Math.PI / 2, new THREE.Vector3(1, 0, 0));
+            addCoordLabel(rank, -LABEL_DIST, wz, Math.PI / 2, new THREE.Vector3(-1, 0, 0));
           });
+          const CAMERA_TARGET_Y = 0.34;
+          const CAMERA_LIFT_Y = 0.78;
           const updateCam = () => {
             const { theta, phi, radius } = s.spherical;
             camera.position.set(
               radius * Math.sin(phi) * Math.sin(theta),
-              radius * Math.cos(phi),
+              radius * Math.cos(phi) + CAMERA_LIFT_Y,
               radius * Math.sin(phi) * Math.cos(theta)
             );
-            camera.lookAt(0, 0.5, 0);
+            camera.lookAt(0, CAMERA_TARGET_Y, 0);
           };
           s.updateCam = updateCam;
           updateCam();
@@ -1086,7 +1208,7 @@
               const dx = e.clientX - s.lastMouse.x;
               const dy = e.clientY - s.lastMouse.y;
               s.spherical.theta -= dx * 8e-3;
-              s.spherical.phi = Math.max(0.18, Math.min(1.45, s.spherical.phi + dy * 8e-3));
+              s.spherical.phi = Math.max(0.18, Math.min(1.32, s.spherical.phi + dy * 8e-3));
               s.lastMouse = { x: e.clientX, y: e.clientY };
               updateCam();
             } else if (s.dragStart) {
@@ -1103,7 +1225,7 @@
             s.dragStart = null;
           };
           const onWheel = (e) => {
-            s.spherical.radius = Math.max(5, Math.min(22, s.spherical.radius + e.deltaY * 0.012));
+            s.spherical.radius = Math.max(6.2, Math.min(22, s.spherical.radius + e.deltaY * 0.012));
             updateCam();
           };
           renderer.domElement.addEventListener("mousedown", onDown);
@@ -1111,6 +1233,8 @@
           renderer.domElement.addEventListener("mouseup", onUp);
           renderer.domElement.addEventListener("wheel", onWheel, { passive: true });
           renderer.domElement.addEventListener("contextmenu", (e) => e.preventDefault());
+          const camToLabel = new THREE.Vector3();
+          const camFlat = new THREE.Vector3();
           const animate = () => {
             s.animId = requestAnimationFrame(animate);
             const phi = s.spherical.phi;
@@ -1124,6 +1248,29 @@
               s.labelSprites.forEach((sp) => {
                 sp.material.opacity = labelOpacity;
               });
+            }
+            if (s.coordLabels.length > 0) {
+              camFlat.set(camera.position.x, 0, camera.position.z);
+              if (camFlat.lengthSq() > 1e-8) camFlat.normalize();
+              const overhead = Math.max(0, Math.min(1, (1.46 - phi) / 1.22));
+              s.coordLabels.forEach((mesh) => {
+                var _a;
+                const mat = mesh.material;
+                if (!mat) return;
+                camToLabel.copy(camera.position).sub(mesh.position).normalize();
+                const topFacing = Math.max(0.08, camToLabel.y);
+                const edgeNormal = (_a = mesh.userData) == null ? void 0 : _a.edgeNormal;
+                const sideFacing = edgeNormal ? Math.max(0, camFlat.dot(edgeNormal) * 0.5 + 0.5) : 0.5;
+                const visibility = Math.max(0.05, Math.min(1, topFacing * 0.6 + sideFacing * 0.5));
+                mat.opacity = 0.18 + visibility * 0.74;
+                mat.emissiveIntensity = 0.03 + visibility * (0.28 + 0.22 * overhead);
+              });
+            }
+            const pulse = performance.now() * 15e-4;
+            darkSideBack.intensity = 1.15 + Math.sin(pulse * 1.2 + 0.5) * 0.16;
+            darkSideFill.intensity = 0.48 + Math.sin(pulse * 1.45) * 0.08;
+            if (darkSideSun.material) {
+              darkSideSun.material.opacity = 0.76 + Math.sin(pulse * 1.55 + 0.9) * 0.12;
             }
             renderer.render(scene, camera);
           };
